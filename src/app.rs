@@ -6,6 +6,7 @@ use ratatui::{
 };
 use sqlx::PgPool;
 use std::env;
+use tracing::info;
 
 /// A lazydocker-inspired database TUI
 #[derive(Parser, Debug)]
@@ -40,12 +41,27 @@ pub enum ConnectionState {
     Failed { error: String },
 }
 
+/// Current view state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CurrentView {
+    /// Showing connection status (connecting or failed).
+    ConnectionStatus,
+    /// Showing table list after successful connection.
+    TableList,
+}
+
 /// Application state.
 pub struct App {
     /// Is the application running?
     pub running: bool,
     /// Database connection state.
     pub connection: ConnectionState,
+    /// Current view.
+    pub current_view: CurrentView,
+    /// List of tables in public schema.
+    pub tables: Vec<String>,
+    /// Currently selected table index.
+    pub selected_table_index: usize,
     /// Event handler.
     pub events: EventHandler,
 }
@@ -55,6 +71,9 @@ impl std::fmt::Debug for App {
         f.debug_struct("App")
             .field("running", &self.running)
             .field("connection", &self.connection)
+            .field("current_view", &self.current_view)
+            .field("tables", &self.tables)
+            .field("selected_table_index", &self.selected_table_index)
             .finish()
     }
 }
@@ -74,6 +93,9 @@ impl App {
         Self {
             running: true,
             connection: ConnectionState::Connecting,
+            current_view: CurrentView::ConnectionStatus,
+            tables: Vec::new(),
+            selected_table_index: 0,
             events,
         }
     }
@@ -104,12 +126,26 @@ impl App {
             AppEvent::Quit => self.quit(),
             AppEvent::ConnectionResult(result) => match result {
                 Ok((pool, db_name)) => {
+                    // Spawn task to fetch tables
+                    let sender = self.events.sender();
+                    let pool_clone = pool.clone();
+                    tokio::spawn(async move {
+                        let tables = fetch_tables(&pool_clone).await;
+                        let _ = sender.send(Event::App(AppEvent::TablesLoaded(tables)));
+                    });
+
                     self.connection = ConnectionState::Connected { pool, db_name };
+                    self.current_view = CurrentView::TableList;
                 }
                 Err(error) => {
                     self.connection = ConnectionState::Failed { error };
+                    self.current_view = CurrentView::ConnectionStatus;
                 }
             },
+            AppEvent::TablesLoaded(tables) => {
+                self.tables = tables;
+                self.selected_table_index = 0;
+            }
         }
     }
 
@@ -119,6 +155,30 @@ impl App {
             KeyCode::Esc | KeyCode::Char('q') => self.events.send(AppEvent::Quit),
             KeyCode::Char('c' | 'C') if key_event.modifiers == KeyModifiers::CONTROL => {
                 self.events.send(AppEvent::Quit)
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if self.current_view == CurrentView::TableList && !self.tables.is_empty() {
+                    if self.selected_table_index > 0 {
+                        self.selected_table_index -= 1;
+                    } else {
+                        self.selected_table_index = self.tables.len() - 1;
+                    }
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if self.current_view == CurrentView::TableList && !self.tables.is_empty() {
+                    if self.selected_table_index < self.tables.len() - 1 {
+                        self.selected_table_index += 1;
+                    } else {
+                        self.selected_table_index = 0;
+                    }
+                }
+            }
+            KeyCode::Enter => {
+                if self.current_view == CurrentView::TableList && !self.tables.is_empty() {
+                    let table_name = &self.tables[self.selected_table_index];
+                    info!("Selected: {}", table_name);
+                }
             }
             _ => {}
         }
@@ -146,4 +206,21 @@ async fn connect_to_database(url: &str) -> Result<(PgPool, String), String> {
         .map_err(|e| format!("Connected but failed to query database name: {e}"))?;
 
     Ok((pool, db_name.0))
+}
+
+/// Fetch all tables in the public schema.
+async fn fetch_tables(pool: &PgPool) -> Vec<String> {
+    let result: Result<Vec<(String,)>, _> = sqlx::query_as(
+        "SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename",
+    )
+    .fetch_all(pool)
+    .await;
+
+    match result {
+        Ok(rows) => rows.into_iter().map(|(name,)| name).collect(),
+        Err(e) => {
+            tracing::error!("Failed to fetch tables: {e}");
+            Vec::new()
+        }
+    }
 }

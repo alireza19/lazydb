@@ -26,6 +26,8 @@ pub enum AppEvent {
     Quit,
     /// Database connection result.
     ConnectionResult(Result<(PgPool, String), String>),
+    /// Tables loaded from database.
+    TablesLoaded(Vec<String>),
 }
 
 /// Terminal event handler.
