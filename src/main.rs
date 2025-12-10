@@ -2,6 +2,7 @@ use crate::app::{App, Cli};
 use clap::Parser;
 
 pub mod app;
+pub mod dotline;
 pub mod event;
 pub mod ui;
 

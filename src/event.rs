@@ -40,6 +40,13 @@ pub struct QueryResult {
     pub is_explain: bool,
 }
 
+/// Stats update from background refresh.
+#[derive(Debug, Clone)]
+pub struct StatsUpdate {
+    pub pg_version: String,
+    pub total_rows: i64,
+}
+
 /// Application events.
 #[derive(Debug)]
 pub enum AppEvent {
@@ -53,6 +60,10 @@ pub enum AppEvent {
     TableDataLoaded(Result<TableDataResult, String>),
     /// SQL query execution result.
     QueryExecuted(Result<QueryResult, String>),
+    /// Stats updated from background task.
+    StatsUpdated(StatsUpdate),
+    /// Sparkline tick (every 1 second).
+    SparklineTick { pool_size: u32 },
 }
 
 /// Terminal event handler.

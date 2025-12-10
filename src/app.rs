@@ -1,4 +1,4 @@
-use crate::event::{AppEvent, Event, EventHandler, QueryResult, TableDataResult};
+use crate::event::{AppEvent, Event, EventHandler, QueryResult, StatsUpdate, TableDataResult};
 use clap::Parser;
 use ratatui::{
     crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
@@ -120,16 +120,19 @@ pub enum FocusedPane {
     Sidebar,
     /// Right results grid (table data or query results).
     Results,
-    /// Bottom SQL editor.
+    /// Bottom-left stats panel.
+    Stats,
+    /// Bottom-right SQL editor.
     Editor,
 }
 
 impl FocusedPane {
-    /// Cycle to next pane (Tab).
+    /// Cycle to next pane (Tab): Sidebar → Results → Stats → Editor → loop
     pub fn next(self) -> Self {
         match self {
             FocusedPane::Sidebar => FocusedPane::Results,
-            FocusedPane::Results => FocusedPane::Editor,
+            FocusedPane::Results => FocusedPane::Stats,
+            FocusedPane::Stats => FocusedPane::Editor,
             FocusedPane::Editor => FocusedPane::Sidebar,
         }
     }
@@ -139,17 +142,88 @@ impl FocusedPane {
         match self {
             FocusedPane::Sidebar => FocusedPane::Editor,
             FocusedPane::Results => FocusedPane::Sidebar,
-            FocusedPane::Editor => FocusedPane::Results,
+            FocusedPane::Stats => FocusedPane::Results,
+            FocusedPane::Editor => FocusedPane::Stats,
         }
     }
 
     /// Display name for footer.
     pub fn label(self) -> &'static str {
         match self {
-            FocusedPane::Sidebar => "Sidebar",
+            FocusedPane::Sidebar => "Tables",
             FocusedPane::Results => "Results",
-            FocusedPane::Editor => "Editor",
+            FocusedPane::Stats => "Stats",
+            FocusedPane::Editor => "SQL",
         }
+    }
+}
+
+/// Maximum sparkline data points.
+pub const SPARKLINE_MAX_POINTS: usize = 60;
+
+/// Stats panel state for connection and query statistics.
+#[derive(Debug, Clone)]
+pub struct StatsState {
+    /// Connection host info.
+    pub host: String,
+    /// Database name.
+    pub database: String,
+    /// PostgreSQL version.
+    pub pg_version: String,
+    /// Number of tables.
+    pub table_count: usize,
+    /// Approximate total rows across all tables.
+    pub total_rows: i64,
+    /// Last query duration in ms.
+    pub last_query_ms: Option<u128>,
+    /// Number of queries run this session.
+    pub queries_run: usize,
+    /// Session start time.
+    pub session_start: Instant,
+    /// Queries per second sparkline data.
+    pub queries_per_sec: VecDeque<u64>,
+    /// Rows per second sparkline data.
+    pub rows_per_sec: VecDeque<u64>,
+    /// Latency (ms) sparkline data.
+    pub latency_ms: VecDeque<u64>,
+    /// Connection pool size sparkline data.
+    pub connections: VecDeque<u64>,
+    /// Queries in the last second (for calculating qps).
+    pub queries_this_second: u64,
+    /// Rows returned in the last second.
+    pub rows_this_second: u64,
+}
+
+impl StatsState {
+    /// Push a new data point to a sparkline, keeping max size.
+    fn push_sparkline(deque: &mut VecDeque<u64>, value: u64) {
+        if deque.len() >= SPARKLINE_MAX_POINTS {
+            deque.pop_front();
+        }
+        deque.push_back(value);
+    }
+
+    /// Record a query execution.
+    pub fn record_query(&mut self, duration_ms: u128, row_count: usize) {
+        self.queries_run += 1;
+        self.last_query_ms = Some(duration_ms);
+        self.queries_this_second += 1;
+        self.rows_this_second += row_count as u64;
+    }
+
+    /// Tick called every second to update sparklines.
+    pub fn tick_second(&mut self, pool_size: u32) {
+        Self::push_sparkline(&mut self.queries_per_sec, self.queries_this_second);
+        Self::push_sparkline(&mut self.rows_per_sec, self.rows_this_second);
+        Self::push_sparkline(
+            &mut self.latency_ms,
+            self.last_query_ms.unwrap_or(0) as u64,
+        );
+        Self::push_sparkline(&mut self.connections, pool_size as u64);
+
+        // Reset per-second counters
+        self.queries_this_second = 0;
+        self.rows_this_second = 0;
     }
 }
 
@@ -189,6 +263,8 @@ pub struct App {
     pub running: bool,
     /// Database connection state.
     pub connection: ConnectionState,
+    /// Original database URL for display.
+    pub database_url: String,
     /// Current view.
     pub current_view: CurrentView,
     /// List of tables in public schema.
@@ -199,6 +275,8 @@ pub struct App {
     pub events: EventHandler,
     /// Handle for the background refresh task.
     refresh_handle: Option<JoinHandle<()>>,
+    /// Handle for the stats refresh task.
+    stats_handle: Option<JoinHandle<()>>,
     /// Which pane is focused.
     pub focused_pane: FocusedPane,
     /// SQL editor text area.
@@ -217,6 +295,8 @@ pub struct App {
     pub query_result: Option<QueryResultState>,
     /// Show query results instead of table view.
     pub show_query_results: bool,
+    /// Stats panel state.
+    pub stats: StatsState,
 }
 
 impl std::fmt::Debug for App {
@@ -229,8 +309,22 @@ impl std::fmt::Debug for App {
             .field("selected_table_index", &self.selected_table_index)
             .field("focused_pane", &self.focused_pane)
             .field("query_executing", &self.query_executing)
+            .field("stats", &self.stats)
             .finish()
     }
+}
+
+/// Parse host info from database URL.
+fn parse_host_from_url(url: &str) -> String {
+    // Try to extract host:port from postgres://user:pass@host:port/db
+    if let Some(at_pos) = url.find('@') {
+        let after_at = &url[at_pos + 1..];
+        if let Some(slash_pos) = after_at.find('/') {
+            return after_at[..slash_pos].to_string();
+        }
+        return after_at.to_string();
+    }
+    "localhost".to_string()
 }
 
 impl App {
@@ -239,24 +333,29 @@ impl App {
         let events = EventHandler::new();
         let sender = events.sender();
 
+        let host = parse_host_from_url(&database_url);
+        let url_for_task = database_url.clone();
+
         // Spawn the connection task
         tokio::spawn(async move {
-            let result = connect_to_database(&database_url).await;
+            let result = connect_to_database(&url_for_task).await;
             let _ = sender.send(Event::App(AppEvent::ConnectionResult(result)));
         });
 
         let mut sql_editor = TextArea::default();
         sql_editor.set_cursor_line_style(ratatui::style::Style::default());
-        sql_editor.set_placeholder_text("-- type : to focus · Ctrl+Enter to run");
+        sql_editor.set_placeholder_text("-- type : to focus · F5 to run");
 
         Self {
             running: true,
             connection: ConnectionState::Connecting,
+            database_url,
             current_view: CurrentView::ConnectionStatus,
             tables: Vec::new(),
             selected_table_index: 0,
             events,
             refresh_handle: None,
+            stats_handle: None,
             focused_pane: FocusedPane::Sidebar,
             sql_editor,
             query_history: VecDeque::new(),
@@ -266,6 +365,22 @@ impl App {
             query_start_time: None,
             query_result: None,
             show_query_results: false,
+            stats: StatsState {
+                host,
+                database: String::new(),
+                pg_version: String::new(),
+                table_count: 0,
+                total_rows: 0,
+                last_query_ms: None,
+                queries_run: 0,
+                session_start: Instant::now(),
+                queries_per_sec: VecDeque::with_capacity(SPARKLINE_MAX_POINTS),
+                rows_per_sec: VecDeque::with_capacity(SPARKLINE_MAX_POINTS),
+                latency_ms: VecDeque::with_capacity(SPARKLINE_MAX_POINTS),
+                connections: VecDeque::with_capacity(SPARKLINE_MAX_POINTS),
+                queries_this_second: 0,
+                rows_this_second: 0,
+            },
         }
     }
 
@@ -301,6 +416,12 @@ impl App {
                         let tables = fetch_tables(&pool_clone).await;
                         let _ = sender.send(Event::App(AppEvent::TablesLoaded(tables)));
                     });
+
+                    // Update stats
+                    self.stats.database = db_name.clone();
+
+                    // Start stats refresh task
+                    self.start_stats_task(&pool);
 
                     self.connection = ConnectionState::Connected { pool, db_name };
                     self.current_view = CurrentView::TableList;
@@ -371,6 +492,8 @@ impl App {
 
                 match result {
                     Ok(qr) => {
+                        // Record for sparklines
+                        self.stats.record_query(qr.duration_ms, qr.row_count);
                         self.query_result = Some(QueryResultState {
                             columns: qr.columns,
                             rows: qr.rows,
@@ -384,6 +507,7 @@ impl App {
                         self.show_query_results = true;
                     }
                     Err(error) => {
+                        self.stats.queries_run += 1;
                         self.query_result = Some(QueryResultState {
                             columns: Vec::new(),
                             rows: Vec::new(),
@@ -397,6 +521,14 @@ impl App {
                         self.show_query_results = true;
                     }
                 }
+            }
+            AppEvent::StatsUpdated(update) => {
+                self.stats.pg_version = update.pg_version;
+                self.stats.total_rows = update.total_rows;
+                self.stats.table_count = self.tables.len();
+            }
+            AppEvent::SparklineTick { pool_size } => {
+                self.stats.tick_second(pool_size);
             }
         }
     }
@@ -433,6 +565,62 @@ impl App {
 
             self.refresh_handle = Some(handle);
         }
+    }
+
+    /// Start the background stats refresh task.
+    fn start_stats_task(&mut self, pool: &PgPool) {
+        let pool = pool.clone();
+        let sender = self.events.sender();
+
+        let handle = tokio::spawn(async move {
+            // Initial fetch immediately
+            if let Some(update) = fetch_stats(&pool).await {
+                let _ = sender.send(Event::App(AppEvent::StatsUpdated(update)));
+            }
+
+            // Sparkline tick every 1 second
+            let mut sparkline_interval = tokio::time::interval(Duration::from_secs(1));
+            // Stats refresh every 5 seconds
+            let mut stats_counter = 0u32;
+
+            sparkline_interval.tick().await;
+
+            loop {
+                sparkline_interval.tick().await;
+
+                if sender.is_closed() {
+                    debug!("stats task stopping – channel closed");
+                    break;
+                }
+
+                if pool.is_closed() {
+                    debug!("stats task stopping – pool closed");
+                    break;
+                }
+
+                // Get pool size for sparkline
+                let pool_size = pool.size();
+                if sender
+                    .send(Event::App(AppEvent::SparklineTick { pool_size }))
+                    .is_err()
+                {
+                    break;
+                }
+
+                // Every 5 seconds, also fetch full stats
+                stats_counter += 1;
+                if stats_counter >= 5 {
+                    stats_counter = 0;
+                    if let Some(update) = fetch_stats(&pool).await
+                        && sender.send(Event::App(AppEvent::StatsUpdated(update))).is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        });
+
+        self.stats_handle = Some(handle);
     }
 
     /// Fetch table data for a given table and page.
@@ -540,7 +728,16 @@ impl App {
             FocusedPane::Editor => self.handle_editor_keys(key_event),
             FocusedPane::Sidebar => self.handle_sidebar_keys(key_event),
             FocusedPane::Results => self.handle_results_keys(key_event),
+            FocusedPane::Stats => self.handle_stats_keys(key_event),
         }
+    }
+
+    /// Handle keys when stats pane is focused.
+    fn handle_stats_keys(&mut self, key_event: KeyEvent) -> color_eyre::Result<()> {
+        if let KeyCode::Char('q') = key_event.code {
+            self.events.send(AppEvent::Quit);
+        }
+        Ok(())
     }
 
     /// Handle keys when SQL editor is focused.
@@ -831,6 +1028,9 @@ impl Drop for App {
         if let Some(handle) = self.refresh_handle.take() {
             handle.abort();
         }
+        if let Some(handle) = self.stats_handle.take() {
+            handle.abort();
+        }
     }
 }
 
@@ -863,6 +1063,38 @@ async fn fetch_tables(pool: &PgPool) -> Vec<String> {
             Vec::new()
         }
     }
+}
+
+/// Fetch stats for the stats panel.
+async fn fetch_stats(pool: &PgPool) -> Option<StatsUpdate> {
+    // Get PostgreSQL version
+    let pg_version: String = sqlx::query_scalar("SELECT version()")
+        .fetch_one(pool)
+        .await
+        .ok()
+        .map(|v: String| {
+            // Extract just "PostgreSQL X.Y.Z" from the full version string
+            v.split_whitespace()
+                .take(2)
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_else(|| "Unknown".to_string());
+
+    // Get approximate total rows across all public tables
+    let total_rows: i64 = sqlx::query_scalar(
+        r#"SELECT COALESCE(SUM(n_live_tup), 0)::bigint 
+           FROM pg_stat_user_tables 
+           WHERE schemaname = 'public'"#,
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0);
+
+    Some(StatsUpdate {
+        pg_version,
+        total_rows,
+    })
 }
 
 /// Fetch a page of data from a table.

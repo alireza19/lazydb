@@ -9,6 +9,7 @@ use ratatui::{
 };
 
 use crate::app::{App, ConnectionState, CurrentView, FocusedPane, QueryResultState, TableViewState};
+use crate::dotline::{make_color_fn, AsciiDotGraph};
 
 /// SQL keywords for syntax highlighting.
 const SQL_KEYWORDS: &[&str] = &[
@@ -86,7 +87,7 @@ fn render_connection_status(app: &App, area: Rect, buf: &mut Buffer) {
         .render(layout[2], buf);
 }
 
-/// Render the main 3-pane layout.
+/// Render the main 4-pane layout.
 fn render_main_layout(app: &App, area: Rect, buf: &mut Buffer) {
     let main_block = Block::bordered()
         .title(" lazydb ")
@@ -97,26 +98,68 @@ fn render_main_layout(app: &App, area: Rect, buf: &mut Buffer) {
     let inner = main_block.inner(area);
     main_block.render(area, buf);
 
-    // Split into top (70%) and bottom (30%) for SQL editor
+    // Split into main content and global status bar at bottom
+    let outer_layout = Layout::vertical([
+        Constraint::Min(1),    // Main content
+        Constraint::Length(1), // Global status bar
+    ])
+    .split(inner);
+
+    let content_area = outer_layout[0];
+    let status_bar_area = outer_layout[1];
+
+    // Split content into top (70%) and bottom (30%)
     let vertical_layout = Layout::vertical([
         Constraint::Percentage(70),
         Constraint::Percentage(30),
     ])
-    .split(inner);
+    .split(content_area);
 
     let top_area = vertical_layout[0];
     let bottom_area = vertical_layout[1];
 
     // Top: horizontal split (30% sidebar + 70% results)
-    let horizontal_layout = Layout::horizontal([
+    let top_horizontal = Layout::horizontal([
         Constraint::Percentage(30),
         Constraint::Percentage(70),
     ])
     .split(top_area);
 
-    render_sidebar(app, horizontal_layout[0], buf);
-    render_content_area(app, horizontal_layout[1], buf);
-    render_sql_editor(app, bottom_area, buf);
+    // Bottom: horizontal split (30% stats + 70% SQL editor)
+    let bottom_horizontal = Layout::horizontal([
+        Constraint::Percentage(30),
+        Constraint::Percentage(70),
+    ])
+    .split(bottom_area);
+
+    render_sidebar(app, top_horizontal[0], buf);
+    render_content_area(app, top_horizontal[1], buf);
+    render_stats_panel(app, bottom_horizontal[0], buf);
+    render_sql_editor(app, bottom_horizontal[1], buf);
+
+    // Render global status bar
+    render_global_status_bar(app, status_bar_area, buf);
+}
+
+/// Render the global status bar at the bottom.
+fn render_global_status_bar(app: &App, area: Rect, buf: &mut Buffer) {
+    let status = Line::from(vec![
+        Span::styled(
+            format!("[{}]", app.focused_pane.label()),
+            Style::default().fg(Color::Yellow).bold(),
+        ),
+        Span::styled(" │ ", Style::default().fg(Color::Rgb(60, 60, 60))),
+        Span::styled("Tab", Style::default().fg(Color::Cyan)),
+        Span::styled(" cycle  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(":", Style::default().fg(Color::Cyan)),
+        Span::styled(" SQL  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("q", Style::default().fg(Color::Cyan)),
+        Span::styled(" quit", Style::default().fg(Color::DarkGray)),
+    ]);
+
+    Paragraph::new(status)
+        .alignment(Alignment::Center)
+        .render(area, buf);
 }
 
 /// Render the left sidebar with table list.
@@ -188,7 +231,7 @@ fn render_sidebar(app: &App, area: Rect, buf: &mut Buffer) {
                         .add_modifier(Modifier::BOLD)
                 } else if is_selected {
                     Style::default()
-                        .fg(Color::Cyan)
+            .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::White)
@@ -208,23 +251,224 @@ fn render_sidebar(app: &App, area: Rect, buf: &mut Buffer) {
         ratatui::widgets::StatefulWidget::render(list, list_area, buf, &mut state);
     }
 
-    // Footer with focus indicator
-    let footer = Line::from(vec![
-        Span::styled(
-            format!("[{}]", app.focused_pane.label()),
-            Style::default().fg(Color::Yellow).bold(),
-        ),
-        Span::styled(" ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            format!("{} tables", app.tables.len()),
-            Style::default().fg(Color::DarkGray),
-        ),
-    ]);
+    // Footer
+    let footer = Line::from(vec![Span::styled(
+        format!("{} tables", app.tables.len()),
+        Style::default().fg(Color::DarkGray),
+    )]);
 
     Paragraph::new(footer)
         .alignment(Alignment::Center)
         .render(footer_area, buf);
 }
+
+/// Render the live ASCII dot-scatter dashboard (bottom-left).
+fn render_stats_panel(app: &App, area: Rect, buf: &mut Buffer) {
+    let is_focused = app.focused_pane == FocusedPane::Stats;
+    let border_color = if is_focused {
+        Color::Yellow
+    } else {
+        Color::Rgb(60, 60, 60)
+    };
+
+    let block = Block::bordered()
+        .title(" ◉ Live Monitor ")
+        .title_style(Style::default().fg(Color::Magenta).bold())
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border_color));
+
+    let inner = block.inner(area);
+    block.render(area, buf);
+
+    // Split into graphs area (top) and info area (bottom)
+    let layout = Layout::vertical([
+        Constraint::Min(4),    // Graphs
+        Constraint::Length(3), // Info text
+    ])
+    .split(inner);
+
+    let graphs_area = layout[0];
+    let info_area = layout[1];
+
+    // Render 4 ASCII dot-scatter graphs in a 2x2 grid
+    render_ascii_graphs(app, graphs_area, buf);
+
+    // Render info text
+    render_stats_info(app, info_area, buf);
+}
+
+/// Render the 4 ASCII dot-scatter graphs in a 2x2 grid layout.
+fn render_ascii_graphs(app: &App, area: Rect, buf: &mut Buffer) {
+    // Split into 2 rows
+    let rows = Layout::vertical([
+        Constraint::Ratio(1, 2),
+        Constraint::Ratio(1, 2),
+    ])
+    .split(area);
+
+    // Split each row into 2 columns
+    let top_cols = Layout::horizontal([
+        Constraint::Ratio(1, 2),
+        Constraint::Ratio(1, 2),
+    ])
+    .split(rows[0]);
+
+    let bottom_cols = Layout::horizontal([
+        Constraint::Ratio(1, 2),
+        Constraint::Ratio(1, 2),
+    ])
+    .split(rows[1]);
+
+    // Color functions for each metric
+    let qps_color = make_color_fn(50, true);
+    let rows_color = make_color_fn(10000, true);
+    let latency_color_fn = make_color_fn(300, false);
+    let conn_color = make_color_fn(20, true);
+
+    // Top-left: Queries/sec
+    render_ascii_graph_cell(
+        "qps",
+        &app.stats.queries_per_sec,
+        &qps_color,
+        top_cols[0],
+        buf,
+    );
+
+    // Top-right: Rows/sec
+    render_ascii_graph_cell(
+        "rows",
+        &app.stats.rows_per_sec,
+        &rows_color,
+        top_cols[1],
+        buf,
+    );
+
+    // Bottom-left: Latency
+    render_ascii_graph_cell(
+        "ms",
+        &app.stats.latency_ms,
+        &latency_color_fn,
+        bottom_cols[0],
+        buf,
+    );
+
+    // Bottom-right: Connections
+    render_ascii_graph_cell(
+        "conn",
+        &app.stats.connections,
+        &conn_color,
+        bottom_cols[1],
+        buf,
+    );
+}
+
+/// Render a single ASCII dot-scatter graph cell with label.
+fn render_ascii_graph_cell<F>(
+    label: &str,
+    data: &std::collections::VecDeque<u64>,
+    color_fn: &F,
+    area: Rect,
+    buf: &mut Buffer,
+)
+where
+    F: Fn(u64, u64) -> Color,
+{
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+
+    // Split into header (label + value) and graph area
+    let layout = Layout::vertical([
+        Constraint::Length(1), // Header
+        Constraint::Min(1),    // Graph
+    ])
+    .split(area);
+
+    let header_area = layout[0];
+    let graph_area = layout[1];
+
+    // Get current value and max for display
+    let current_value = data.back().copied().unwrap_or(0);
+    let observed_max = data.iter().max().copied().unwrap_or(1).max(1);
+    let current_color = color_fn(current_value, observed_max);
+
+    // Render header: label on left, value on right
+    let header_line = Line::from(vec![
+        Span::styled(format!(" {} ", label), Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("{:>4}", current_value),
+            Style::default().fg(current_color).bold(),
+        ),
+    ]);
+    Paragraph::new(header_line).render(header_area, buf);
+
+    // Render ASCII dot-scatter graph
+    let graph_height = graph_area.height.max(1);
+    let graph = AsciiDotGraph::new(data, observed_max, color_fn).height(graph_height);
+    graph.render(graph_area, buf);
+}
+
+/// Render the stats info text below graphs.
+fn render_stats_info(app: &App, area: Rect, buf: &mut Buffer) {
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("● ", Style::default().fg(Color::Rgb(80, 255, 80))),
+            Span::styled(&app.stats.host, Style::default().fg(Color::White)),
+            Span::styled(" │ ", Style::default().fg(Color::Rgb(60, 60, 60))),
+            Span::styled(&app.stats.database, Style::default().fg(Color::Cyan).bold()),
+        ]),
+        Line::from(vec![
+            Span::styled("Tables: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{}", app.stats.table_count),
+                Style::default().fg(Color::White),
+            ),
+            Span::styled(" │ ", Style::default().fg(Color::Rgb(60, 60, 60))),
+            Span::styled("Last: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                app.stats
+                    .last_query_ms
+                    .map_or("—".to_string(), |ms| format!("{}ms", ms)),
+                latency_color(app.stats.last_query_ms.unwrap_or(0) as u64),
+            ),
+            Span::styled(" │ ", Style::default().fg(Color::Rgb(60, 60, 60))),
+            Span::styled("Total: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{}", app.stats.queries_run),
+                Style::default().fg(Color::White),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                if app.stats.pg_version.is_empty() {
+                    "PostgreSQL".to_string()
+                } else {
+                    app.stats.pg_version.clone()
+                },
+                Style::default().fg(Color::Rgb(80, 80, 80)).italic(),
+            ),
+        ]),
+    ];
+
+    Paragraph::new(lines).render(area, buf);
+}
+
+/// Get color for latency value.
+fn latency_color(ms: u64) -> Style {
+    let color = if ms == 0 {
+        Color::DarkGray
+    } else if ms < 100 {
+        Color::Rgb(80, 255, 80)   // Green
+    } else if ms < 200 {
+        Color::Rgb(255, 255, 0)   // Yellow
+    } else if ms < 300 {
+        Color::Rgb(255, 165, 0)   // Orange
+    } else {
+        Color::Rgb(255, 80, 80)   // Red
+    };
+    Style::default().fg(color)
+}
+
 
 /// Render the right content area.
 fn render_content_area(app: &App, area: Rect, buf: &mut Buffer) {
@@ -384,12 +628,6 @@ fn render_query_results(qr: &QueryResultState, app: &App, area: Rect, buf: &mut 
 
     // Footer
     let footer = Line::from(vec![
-        // Focus indicator
-        Span::styled(
-            format!("[{}]", app.focused_pane.label()),
-            Style::default().fg(Color::Yellow).bold(),
-        ),
-        Span::styled(" │ ", Style::default().fg(Color::Rgb(60, 60, 60))),
         Span::styled(
             format!("{} rows", qr.row_count),
             Style::default().fg(Color::Cyan),
@@ -400,12 +638,8 @@ fn render_query_results(qr: &QueryResultState, app: &App, area: Rect, buf: &mut 
             Style::default().fg(Color::Green),
         ),
         Span::styled(" │ ", Style::default().fg(Color::Rgb(60, 60, 60))),
-        Span::styled("Tab", Style::default().fg(Color::Cyan)),
-        Span::styled(" cycle  ", Style::default().fg(Color::DarkGray)),
         Span::styled("c", Style::default().fg(Color::Cyan)),
-        Span::styled(" clear  ", Style::default().fg(Color::DarkGray)),
-        Span::styled(":", Style::default().fg(Color::Cyan)),
-        Span::styled(" SQL", Style::default().fg(Color::DarkGray)),
+        Span::styled(" clear", Style::default().fg(Color::DarkGray)),
     ]);
 
     Paragraph::new(footer)
@@ -544,17 +778,11 @@ pub fn visible_row_count(area: Rect) -> usize {
 }
 
 /// Render the table view footer.
-fn render_table_footer(state: &TableViewState, app: &App, area: Rect, buf: &mut Buffer) {
+fn render_table_footer(state: &TableViewState, _app: &App, area: Rect, buf: &mut Buffer) {
     let total_pages = state.total_pages();
     let current_page = state.page + 1;
 
     let spans = vec![
-        // Focus indicator
-        Span::styled(
-            format!("[{}]", app.focused_pane.label()),
-            Style::default().fg(Color::Yellow).bold(),
-        ),
-        Span::styled(" │ ", Style::default().fg(Color::Rgb(60, 60, 60))),
         Span::styled("Page ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             format!("{}", current_page),
@@ -571,14 +799,10 @@ fn render_table_footer(state: &TableViewState, app: &App, area: Rect, buf: &mut 
             Style::default().fg(Color::Cyan),
         ),
         Span::styled(" │ ", Style::default().fg(Color::Rgb(60, 60, 60))),
-        Span::styled("Tab", Style::default().fg(Color::Cyan)),
-        Span::styled(" cycle  ", Style::default().fg(Color::DarkGray)),
         Span::styled("←→", Style::default().fg(Color::Cyan)),
         Span::styled(" page  ", Style::default().fg(Color::DarkGray)),
         Span::styled("↑↓", Style::default().fg(Color::Cyan)),
-        Span::styled(" row  ", Style::default().fg(Color::DarkGray)),
-        Span::styled(":", Style::default().fg(Color::Cyan)),
-        Span::styled(" SQL", Style::default().fg(Color::DarkGray)),
+        Span::styled(" row", Style::default().fg(Color::DarkGray)),
     ];
 
     let footer = Line::from(spans);
@@ -679,31 +903,17 @@ fn render_sql_editor(app: &App, area: Rect, buf: &mut Buffer) {
         // Show running indicator
         let elapsed = app.query_elapsed_ms().unwrap_or(0);
         Line::from(vec![
-            Span::styled(
-                format!("[{}]", app.focused_pane.label()),
-                Style::default().fg(Color::Yellow).bold(),
-            ),
-            Span::styled(" │ ", Style::default().fg(Color::Rgb(60, 60, 60))),
             Span::styled("⟳ Running", Style::default().fg(Color::Yellow).bold()),
             Span::styled(format!(" {}ms...", elapsed), Style::default().fg(Color::Yellow)),
         ])
     } else {
         Line::from(vec![
-            Span::styled(
-                format!("[{}]", app.focused_pane.label()),
-                Style::default().fg(Color::Yellow).bold(),
-            ),
-            Span::styled(" │ ", Style::default().fg(Color::Rgb(60, 60, 60))),
-            Span::styled("Tab", Style::default().fg(Color::Cyan)),
-            Span::styled(" cycle  ", Style::default().fg(Color::DarkGray)),
             Span::styled("F5", Style::default().fg(Color::Cyan)),
             Span::styled("/", Style::default().fg(Color::DarkGray)),
             Span::styled("Shift+Enter", Style::default().fg(Color::Cyan)),
             Span::styled(" run  ", Style::default().fg(Color::DarkGray)),
             Span::styled("↑↓", Style::default().fg(Color::Cyan)),
-            Span::styled(" history  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Esc", Style::default().fg(Color::Cyan)),
-            Span::styled(" back", Style::default().fg(Color::DarkGray)),
+            Span::styled(" history", Style::default().fg(Color::DarkGray)),
             if !history_indicator.is_empty() {
                 Span::styled(format!("  │ {}", history_indicator), Style::default().fg(Color::Rgb(80, 80, 80)))
             } else {
