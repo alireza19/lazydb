@@ -29,6 +29,17 @@ pub struct TableDataResult {
     pub page: usize,
 }
 
+/// Result of executing a SQL query.
+#[derive(Debug, Clone)]
+pub struct QueryResult {
+    pub query: String,
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<String>>,
+    pub row_count: usize,
+    pub duration_ms: u128,
+    pub is_explain: bool,
+}
+
 /// Application events.
 #[derive(Debug)]
 pub enum AppEvent {
@@ -40,6 +51,8 @@ pub enum AppEvent {
     TablesLoaded(Vec<String>),
     /// Table data loaded.
     TableDataLoaded(Result<TableDataResult, String>),
+    /// SQL query execution result.
+    QueryExecuted(Result<QueryResult, String>),
 }
 
 /// Terminal event handler.

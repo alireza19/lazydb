@@ -4,25 +4,36 @@ use ratatui::{
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
     widgets::{
-        Block, BorderType, Cell, List, ListItem, ListState, Paragraph, Row, Table, Widget,
+        Block, BorderType, Cell, List, ListItem, ListState, Paragraph, Row, Table, Widget, Wrap,
     },
 };
 
-use crate::app::{App, ConnectionState, CurrentView, TableViewState};
+use crate::app::{App, ConnectionState, CurrentView, FocusedPane, QueryResultState, TableViewState};
+
+/// SQL keywords for syntax highlighting.
+const SQL_KEYWORDS: &[&str] = &[
+    "SELECT", "FROM", "WHERE", "AND", "OR", "NOT", "IN", "LIKE", "BETWEEN", "IS", "NULL",
+    "ORDER", "BY", "ASC", "DESC", "LIMIT", "OFFSET", "GROUP", "HAVING", "JOIN", "LEFT",
+    "RIGHT", "INNER", "OUTER", "FULL", "CROSS", "ON", "AS", "DISTINCT", "COUNT", "SUM",
+    "AVG", "MIN", "MAX", "INSERT", "INTO", "VALUES", "UPDATE", "SET", "DELETE", "CREATE",
+    "TABLE", "DROP", "ALTER", "INDEX", "VIEW", "TRIGGER", "FUNCTION", "PROCEDURE", "BEGIN",
+    "END", "IF", "ELSE", "THEN", "CASE", "WHEN", "ELSE", "COALESCE", "NULLIF", "CAST",
+    "UNION", "ALL", "INTERSECT", "EXCEPT", "EXISTS", "ANY", "SOME", "EXPLAIN", "ANALYZE",
+    "WITH", "RECURSIVE", "RETURNING", "CONFLICT", "DO", "NOTHING", "TRUE", "FALSE",
+];
 
 impl Widget for &App {
     fn render(self, area: Rect, buf: &mut Buffer) {
         match &self.current_view {
             CurrentView::ConnectionStatus => render_connection_status(self, area, buf),
-            CurrentView::TableList => render_main_view(self, area, buf),
-            CurrentView::TableView(_) => render_main_view(self, area, buf),
+            _ => render_main_layout(self, area, buf),
         }
     }
 }
 
 /// Render the connection status view (connecting or failed).
 fn render_connection_status(app: &App, area: Rect, buf: &mut Buffer) {
-    let block = Block::bordered()
+        let block = Block::bordered()
         .title(" lazydb ")
         .title_alignment(Alignment::Center)
         .border_type(BorderType::Rounded)
@@ -75,25 +86,37 @@ fn render_connection_status(app: &App, area: Rect, buf: &mut Buffer) {
         .render(layout[2], buf);
 }
 
-/// Render the main view with sidebar and content area.
-fn render_main_view(app: &App, area: Rect, buf: &mut Buffer) {
+/// Render the main 3-pane layout.
+fn render_main_layout(app: &App, area: Rect, buf: &mut Buffer) {
     let main_block = Block::bordered()
         .title(" lazydb ")
-        .title_alignment(Alignment::Center)
+            .title_alignment(Alignment::Center)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::DarkGray));
 
     let inner = main_block.inner(area);
     main_block.render(area, buf);
 
+    // Split into top (70%) and bottom (30%) for SQL editor
+    let vertical_layout = Layout::vertical([
+        Constraint::Percentage(70),
+        Constraint::Percentage(30),
+    ])
+    .split(inner);
+
+    let top_area = vertical_layout[0];
+    let bottom_area = vertical_layout[1];
+
+    // Top: horizontal split (30% sidebar + 70% results)
     let horizontal_layout = Layout::horizontal([
         Constraint::Percentage(30),
         Constraint::Percentage(70),
     ])
-    .split(inner);
+    .split(top_area);
 
     render_sidebar(app, horizontal_layout[0], buf);
     render_content_area(app, horizontal_layout[1], buf);
+    render_sql_editor(app, bottom_area, buf);
 }
 
 /// Render the left sidebar with table list.
@@ -103,17 +126,23 @@ fn render_sidebar(app: &App, area: Rect, buf: &mut Buffer) {
         _ => "database",
     };
 
-    // Check if we're viewing a table (to highlight it differently)
     let viewing_table = match &app.current_view {
         CurrentView::TableView(state) => Some(state.table_name.as_str()),
         _ => None,
+    };
+
+    let is_focused = app.focused_pane == FocusedPane::Navigation && !app.show_query_results;
+    let border_color = if is_focused {
+        Color::Cyan
+    } else {
+        Color::Rgb(60, 60, 60)
     };
 
     let sidebar_block = Block::bordered()
         .title(format!(" {} ", db_name))
         .title_style(Style::default().fg(Color::Cyan).bold())
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Rgb(60, 60, 60)));
+        .border_style(Style::default().fg(border_color));
 
     let sidebar_inner = sidebar_block.inner(area);
     sidebar_block.render(area, buf);
@@ -149,7 +178,7 @@ fn render_sidebar(app: &App, area: Rect, buf: &mut Buffer) {
                         .add_modifier(Modifier::BOLD)
                 } else if is_selected {
                     Style::default()
-                        .fg(Color::Cyan)
+            .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::White)
@@ -172,19 +201,32 @@ fn render_sidebar(app: &App, area: Rect, buf: &mut Buffer) {
 
 /// Render the right content area.
 fn render_content_area(app: &App, area: Rect, buf: &mut Buffer) {
-    match &app.current_view {
-        CurrentView::TableView(state) => render_table_view(state, area, buf),
-        _ => render_placeholder(area, buf),
+    if app.show_query_results {
+        if let Some(ref qr) = app.query_result {
+            render_query_results(qr, app, area, buf);
+        }
+    } else {
+        match &app.current_view {
+            CurrentView::TableView(state) => render_table_view(state, app, area, buf),
+            _ => render_placeholder(app, area, buf),
+        }
     }
 }
 
 /// Render placeholder when no table is selected.
-fn render_placeholder(area: Rect, buf: &mut Buffer) {
+fn render_placeholder(app: &App, area: Rect, buf: &mut Buffer) {
+    let is_focused = app.focused_pane == FocusedPane::Navigation;
+    let border_color = if is_focused {
+        Color::Rgb(80, 80, 100)
+    } else {
+        Color::Rgb(60, 60, 60)
+    };
+
     let content_block = Block::bordered()
-        .title(" Table Details ")
+        .title(" Results ")
         .title_style(Style::default().fg(Color::Magenta).bold())
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Rgb(60, 60, 60)));
+        .border_style(Style::default().fg(border_color));
 
     let content_inner = content_block.inner(area);
     content_block.render(area, buf);
@@ -210,6 +252,8 @@ fn render_placeholder(area: Rect, buf: &mut Buffer) {
         Span::styled(" navigate  ", Style::default().fg(Color::DarkGray)),
         Span::styled("Enter", Style::default().fg(Color::Cyan)),
         Span::styled(" select  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(":", Style::default().fg(Color::Cyan)),
+        Span::styled(" SQL  ", Style::default().fg(Color::DarkGray)),
         Span::styled("q", Style::default().fg(Color::Cyan)),
         Span::styled(" quit", Style::default().fg(Color::DarkGray)),
     ]);
@@ -220,17 +264,23 @@ fn render_placeholder(area: Rect, buf: &mut Buffer) {
 }
 
 /// Render the table data view.
-fn render_table_view(state: &TableViewState, area: Rect, buf: &mut Buffer) {
+fn render_table_view(state: &TableViewState, app: &App, area: Rect, buf: &mut Buffer) {
+    let is_focused = app.focused_pane == FocusedPane::Navigation;
+    let border_color = if is_focused {
+        Color::Rgb(80, 80, 100)
+    } else {
+        Color::Rgb(60, 60, 60)
+    };
+
     let content_block = Block::bordered()
         .title(format!(" {} ", state.table_name))
         .title_style(Style::default().fg(Color::Magenta).bold())
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Rgb(60, 60, 60)));
+        .border_style(Style::default().fg(border_color));
 
     let content_inner = content_block.inner(area);
     content_block.render(area, buf);
 
-    // Split into table area and footer
     let layout = Layout::vertical([
         Constraint::Min(3),
         Constraint::Length(1),
@@ -240,90 +290,151 @@ fn render_table_view(state: &TableViewState, area: Rect, buf: &mut Buffer) {
     let table_area = layout[0];
     let footer_area = layout[1];
 
-    // Handle loading state
     if state.loading {
-        let loading = Paragraph::new(Line::from(vec![
-            Span::styled("⟳ ", Style::default().fg(Color::Yellow)),
-            Span::styled("Loading...", Style::default().fg(Color::Yellow)),
-        ]))
-        .alignment(Alignment::Center);
-
-        let centered = Layout::vertical([
-            Constraint::Fill(1),
-            Constraint::Length(1),
-            Constraint::Fill(1),
-        ])
-        .split(table_area);
-
-        loading.render(centered[1], buf);
+        render_centered_message(table_area, buf, "⟳ ", "Loading...", Color::Yellow);
     } else if let Some(error) = &state.error {
-        // Handle error state
-        let error_msg = Paragraph::new(Line::from(vec![
-            Span::styled("✗ ", Style::default().fg(Color::Red)),
-            Span::styled(error.clone(), Style::default().fg(Color::Red)),
-        ]))
-        .alignment(Alignment::Center);
-
-        let centered = Layout::vertical([
-            Constraint::Fill(1),
-            Constraint::Length(1),
-            Constraint::Fill(1),
-        ])
-        .split(table_area);
-
-        error_msg.render(centered[1], buf);
+        render_centered_message(table_area, buf, "✗ ", error, Color::Red);
     } else if state.rows.is_empty() {
-        // Handle empty table
-        let empty = Paragraph::new(Line::from(vec![Span::styled(
-            "<empty table>",
-            Style::default().fg(Color::DarkGray).italic(),
-        )]))
-        .alignment(Alignment::Center);
-
-        let centered = Layout::vertical([
-            Constraint::Fill(1),
-            Constraint::Length(1),
-            Constraint::Fill(1),
-        ])
-        .split(table_area);
-
-        empty.render(centered[1], buf);
+        render_centered_message(table_area, buf, "", "<empty table>", Color::DarkGray);
     } else {
-        // Render the data table
-        render_data_table(state, table_area, buf);
+        render_data_table(&state.columns, &state.rows, state.selected_row, table_area, buf);
     }
 
-    // Render footer
     render_table_footer(state, footer_area, buf);
 }
 
+/// Render query results.
+fn render_query_results(qr: &QueryResultState, app: &App, area: Rect, buf: &mut Buffer) {
+    let is_focused = app.focused_pane == FocusedPane::Navigation;
+    let border_color = if is_focused {
+        Color::Rgb(80, 80, 100)
+    } else {
+        Color::Rgb(60, 60, 60)
+    };
+
+    let title = if qr.error.is_some() {
+        " Query Error "
+    } else {
+        " Query Results "
+    };
+
+    let content_block = Block::bordered()
+        .title(title)
+        .title_style(Style::default().fg(Color::Magenta).bold())
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border_color));
+
+    let content_inner = content_block.inner(area);
+    content_block.render(area, buf);
+
+    let layout = Layout::vertical([
+        Constraint::Min(3),
+        Constraint::Length(1),
+    ])
+    .split(content_inner);
+
+    let table_area = layout[0];
+    let footer_area = layout[1];
+
+    if let Some(error) = &qr.error {
+        // Render error message
+        let error_para = Paragraph::new(error.clone())
+            .style(Style::default().fg(Color::Red))
+            .wrap(Wrap { trim: false });
+        error_para.render(table_area, buf);
+    } else if qr.rows.is_empty() {
+        if qr.columns.is_empty() {
+            render_centered_message(table_area, buf, "✓ ", "Query executed successfully", Color::Green);
+        } else {
+            render_centered_message(table_area, buf, "", "<no rows returned>", Color::DarkGray);
+        }
+    } else if qr.is_explain {
+        // Render EXPLAIN as text
+        render_explain_results(qr, table_area, buf);
+    } else {
+        render_data_table(&qr.columns, &qr.rows, qr.selected_row, table_area, buf);
+    }
+
+    // Footer
+    let footer = Line::from(vec![
+        Span::styled(
+            format!("{} rows", qr.row_count),
+            Style::default().fg(Color::Cyan),
+        ),
+        Span::styled(" │ ", Style::default().fg(Color::Rgb(60, 60, 60))),
+        Span::styled(
+            format!("{}ms", qr.duration_ms),
+            Style::default().fg(Color::Green),
+        ),
+        Span::styled(" │ ", Style::default().fg(Color::Rgb(60, 60, 60))),
+        Span::styled("c", Style::default().fg(Color::Cyan)),
+        Span::styled(" clear  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(":", Style::default().fg(Color::Cyan)),
+        Span::styled(" SQL  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("q", Style::default().fg(Color::Cyan)),
+        Span::styled(" quit", Style::default().fg(Color::DarkGray)),
+    ]);
+
+    Paragraph::new(footer)
+        .alignment(Alignment::Center)
+        .render(footer_area, buf);
+}
+
+/// Render EXPLAIN results as a tree-like text.
+fn render_explain_results(qr: &QueryResultState, area: Rect, buf: &mut Buffer) {
+    let lines: Vec<Line> = qr.rows.iter().map(|row| {
+        let text = row.first().map(|s| s.as_str()).unwrap_or("");
+        Line::from(Span::styled(text, Style::default().fg(Color::White)))
+    }).collect();
+
+    let para = Paragraph::new(lines)
+        .style(Style::default())
+        .wrap(Wrap { trim: false });
+
+    para.render(area, buf);
+}
+
+/// Render a centered message.
+fn render_centered_message(area: Rect, buf: &mut Buffer, prefix: &str, msg: &str, color: Color) {
+    let centered = Layout::vertical([
+        Constraint::Fill(1),
+        Constraint::Length(1),
+        Constraint::Fill(1),
+    ])
+    .split(area);
+
+    let line = Line::from(vec![
+        Span::styled(prefix, Style::default().fg(color)),
+        Span::styled(msg, Style::default().fg(color)),
+    ]);
+
+    Paragraph::new(line)
+        .alignment(Alignment::Center)
+        .render(centered[1], buf);
+}
+
 /// Render the actual data table.
-fn render_data_table(state: &TableViewState, area: Rect, buf: &mut Buffer) {
-    // Calculate column widths based on content
-    let col_count = state.columns.len();
+fn render_data_table(columns: &[String], rows: &[Vec<String>], selected_row: usize, area: Rect, buf: &mut Buffer) {
+    let col_count = columns.len();
     if col_count == 0 {
         return;
     }
 
-    // Calculate max width for each column
-    let mut col_widths: Vec<usize> = state.columns.iter().map(|c| c.len()).collect();
-    for row in &state.rows {
+    let mut col_widths: Vec<usize> = columns.iter().map(|c| c.len()).collect();
+    for row in rows {
         for (i, cell) in row.iter().enumerate() {
             if i < col_widths.len() {
-                col_widths[i] = col_widths[i].max(cell.len().min(30)); // Cap at 30 chars
+                col_widths[i] = col_widths[i].max(cell.len().min(30));
             }
         }
     }
 
-    // Create constraints
     let constraints: Vec<Constraint> = col_widths
         .iter()
         .map(|&w| Constraint::Length((w + 2) as u16))
         .collect();
 
-    // Create header row
-    let header_cells: Vec<Cell> = state
-        .columns
+    let header_cells: Vec<Cell> = columns
         .iter()
         .map(|col| {
             Cell::from(col.clone())
@@ -334,13 +445,11 @@ fn render_data_table(state: &TableViewState, area: Rect, buf: &mut Buffer) {
         .style(Style::default())
         .height(1);
 
-    // Create data rows
-    let rows: Vec<Row> = state
-        .rows
+    let data_rows: Vec<Row> = rows
         .iter()
         .enumerate()
         .map(|(i, row)| {
-            let is_selected = i == state.selected_row;
+            let is_selected = i == selected_row;
             let cells: Vec<Cell> = row
                 .iter()
                 .map(|cell| {
@@ -370,7 +479,7 @@ fn render_data_table(state: &TableViewState, area: Rect, buf: &mut Buffer) {
         })
         .collect();
 
-    let table = Table::new(rows, constraints)
+    let table = Table::new(data_rows, constraints)
         .header(header)
         .row_highlight_style(Style::default().bg(Color::Rgb(40, 40, 60)));
 
@@ -403,9 +512,9 @@ fn render_table_footer(state: &TableViewState, area: Rect, buf: &mut Buffer) {
         Span::styled(" page  ", Style::default().fg(Color::DarkGray)),
         Span::styled("↑↓", Style::default().fg(Color::Cyan)),
         Span::styled(" row  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(":", Style::default().fg(Color::Cyan)),
+        Span::styled(" SQL  ", Style::default().fg(Color::DarkGray)),
         Span::styled("b", Style::default().fg(Color::Cyan)),
-        Span::styled("/", Style::default().fg(Color::DarkGray)),
-        Span::styled("Esc", Style::default().fg(Color::Cyan)),
         Span::styled(" back  ", Style::default().fg(Color::DarkGray)),
         Span::styled("q", Style::default().fg(Color::Cyan)),
         Span::styled(" quit", Style::default().fg(Color::DarkGray)),
@@ -414,4 +523,211 @@ fn render_table_footer(state: &TableViewState, area: Rect, buf: &mut Buffer) {
     Paragraph::new(footer)
         .alignment(Alignment::Center)
         .render(area, buf);
+}
+
+/// Render the SQL editor.
+fn render_sql_editor(app: &App, area: Rect, buf: &mut Buffer) {
+    let is_focused = app.focused_pane == FocusedPane::SqlEditor;
+    let border_color = if is_focused {
+        Color::Yellow
+    } else {
+        Color::Rgb(60, 60, 60)
+    };
+
+    let title = if app.query_executing {
+        format!(" SQL ⟳ {}ms ", app.query_elapsed_ms().unwrap_or(0))
+    } else if is_focused {
+        " SQL [editing] ".to_string()
+    } else {
+        " SQL ".to_string()
+    };
+
+    let block = Block::bordered()
+        .title(title)
+        .title_style(if is_focused {
+            Style::default().fg(Color::Yellow).bold()
+        } else {
+            Style::default().fg(Color::Rgb(100, 100, 100))
+        })
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border_color));
+
+    let inner = block.inner(area);
+    block.render(area, buf);
+
+    // Split for content and footer
+    let layout = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+
+    let editor_area = layout[0];
+    let footer_area = layout[1];
+
+    // Render the editor content with syntax highlighting
+    let lines = app.sql_editor.lines();
+    let cursor = app.sql_editor.cursor();
+
+    let highlighted_lines: Vec<Line> = lines
+        .iter()
+        .enumerate()
+        .map(|(line_idx, line)| {
+            if line.is_empty() && !is_focused {
+                // Show placeholder for empty editor
+                if line_idx == 0 && lines.len() == 1 {
+                    return Line::from(Span::styled(
+                        "-- type : to focus · F5 or Shift+Enter to run",
+                        Style::default().fg(Color::Rgb(80, 80, 80)).italic(),
+                    ));
+                }
+            }
+            highlight_sql_line(line, line_idx, cursor, is_focused)
+        })
+        .collect();
+
+    let editor_widget = Paragraph::new(highlighted_lines)
+        .style(Style::default().fg(Color::White));
+
+    editor_widget.render(editor_area, buf);
+
+    // Draw cursor if focused
+    if is_focused {
+        let (cursor_row, cursor_col) = cursor;
+        let cursor_y = editor_area.y + cursor_row as u16;
+        let cursor_x = editor_area.x + cursor_col as u16;
+
+        if cursor_y < editor_area.y + editor_area.height
+            && cursor_x < editor_area.x + editor_area.width
+            && let Some(cell) = buf.cell_mut((cursor_x, cursor_y))
+        {
+            cell.set_style(Style::default().bg(Color::White).fg(Color::Black));
+        }
+    }
+
+    // Footer with history indicator and running state
+    let history_indicator = if let Some(idx) = app.history_index {
+        format!("history [{}/{}]", idx + 1, app.query_history.len())
+    } else {
+        String::new()
+    };
+
+    let footer = if app.query_executing {
+        // Show running indicator
+        let elapsed = app.query_elapsed_ms().unwrap_or(0);
+        Line::from(vec![
+            Span::styled("⟳ Running", Style::default().fg(Color::Yellow).bold()),
+            Span::styled(format!(" {}ms...", elapsed), Style::default().fg(Color::Yellow)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled("F5", Style::default().fg(Color::Cyan)),
+            Span::styled("/", Style::default().fg(Color::DarkGray)),
+            Span::styled("Ctrl+J", Style::default().fg(Color::Cyan)),
+            Span::styled("/", Style::default().fg(Color::DarkGray)),
+            Span::styled("Shift+Enter", Style::default().fg(Color::Cyan)),
+            Span::styled(" run  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("↑↓", Style::default().fg(Color::Cyan)),
+            Span::styled(" history  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Esc", Style::default().fg(Color::Cyan)),
+            Span::styled(" back", Style::default().fg(Color::DarkGray)),
+            if !history_indicator.is_empty() {
+                Span::styled(format!("  │ {}", history_indicator), Style::default().fg(Color::Rgb(80, 80, 80)))
+            } else {
+                Span::raw("")
+            },
+        ])
+    };
+
+    Paragraph::new(footer)
+        .alignment(Alignment::Center)
+        .render(footer_area, buf);
+}
+
+/// Highlight a single SQL line.
+fn highlight_sql_line(line: &str, line_idx: usize, cursor: (usize, usize), is_focused: bool) -> Line<'static> {
+    let (cursor_row, _cursor_col) = cursor;
+    let is_cursor_line = line_idx == cursor_row && is_focused;
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut i = 0;
+    let chars: Vec<char> = line.chars().collect();
+
+    while i < chars.len() {
+        // Check for string literals (single quotes)
+        if chars[i] == '\'' {
+            let start = i;
+            i += 1;
+            while i < chars.len() && chars[i] != '\'' {
+                i += 1;
+            }
+            if i < chars.len() {
+                i += 1; // Include closing quote
+            }
+            let s: String = chars[start..i].iter().collect();
+            spans.push(Span::styled(s, Style::default().fg(Color::Green)));
+            continue;
+        }
+
+        // Check for comments (--)
+        if i + 1 < chars.len() && chars[i] == '-' && chars[i + 1] == '-' {
+            let s: String = chars[i..].iter().collect();
+            spans.push(Span::styled(s, Style::default().fg(Color::DarkGray).italic()));
+            break;
+        }
+
+        // Check for keywords
+        let remaining: String = chars[i..].iter().collect();
+        let mut found_keyword = false;
+
+        for &keyword in SQL_KEYWORDS {
+            if remaining.to_uppercase().starts_with(keyword) {
+                // Check it's a whole word
+                let next_idx = i + keyword.len();
+                let is_word_boundary = next_idx >= chars.len()
+                    || !chars[next_idx].is_alphanumeric() && chars[next_idx] != '_';
+                let is_start_boundary = i == 0
+                    || !chars[i - 1].is_alphanumeric() && chars[i - 1] != '_';
+
+                if is_word_boundary && is_start_boundary {
+                    let s: String = chars[i..next_idx].iter().collect();
+                    spans.push(Span::styled(s, Style::default().fg(Color::Blue).bold()));
+                    i = next_idx;
+                    found_keyword = true;
+                    break;
+                }
+            }
+        }
+
+        if found_keyword {
+            continue;
+        }
+
+        // Check for numbers
+        if chars[i].is_ascii_digit() {
+            let start = i;
+            while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.') {
+                i += 1;
+            }
+            let s: String = chars[start..i].iter().collect();
+            spans.push(Span::styled(s, Style::default().fg(Color::Rgb(255, 180, 100))));
+            continue;
+        }
+
+        // Regular character
+        spans.push(Span::styled(
+            chars[i].to_string(),
+            Style::default().fg(Color::White),
+        ));
+        i += 1;
+    }
+
+    // Highlight cursor line background slightly
+    let line_style = if is_cursor_line {
+        Style::default().bg(Color::Rgb(30, 30, 40))
+    } else {
+        Style::default()
+    };
+
+    Line::from(spans).style(line_style)
 }

@@ -1,17 +1,22 @@
-use crate::event::{AppEvent, Event, EventHandler, TableDataResult};
+use crate::event::{AppEvent, Event, EventHandler, QueryResult, TableDataResult};
 use clap::Parser;
 use ratatui::{
     crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
     DefaultTerminal,
 };
 use sqlx::{Column, PgPool, Row};
+use std::collections::VecDeque;
 use std::env;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 use tracing::{debug, info};
+use tui_textarea::TextArea;
 
 /// Page size for table data pagination.
 pub const PAGE_SIZE: usize = 50;
+
+/// Maximum query history size.
+pub const MAX_HISTORY: usize = 20;
 
 /// A lazydocker-inspired database TUI
 #[derive(Parser, Debug)]
@@ -89,6 +94,27 @@ pub enum CurrentView {
     TableView(TableViewState),
 }
 
+/// Which pane has focus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusedPane {
+    /// Sidebar/results navigation.
+    Navigation,
+    /// SQL editor.
+    SqlEditor,
+}
+
+/// SQL query result state for display.
+#[derive(Debug, Clone)]
+pub struct QueryResultState {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<String>>,
+    pub row_count: usize,
+    pub duration_ms: u128,
+    pub is_explain: bool,
+    pub selected_row: usize,
+    pub error: Option<String>,
+}
+
 /// Application state.
 pub struct App {
     /// Is the application running?
@@ -105,6 +131,24 @@ pub struct App {
     pub events: EventHandler,
     /// Handle for the background refresh task.
     refresh_handle: Option<JoinHandle<()>>,
+    /// Which pane is focused.
+    pub focused_pane: FocusedPane,
+    /// SQL editor text area.
+    pub sql_editor: TextArea<'static>,
+    /// Query history.
+    pub query_history: VecDeque<String>,
+    /// Current position in history (None = not browsing history).
+    pub history_index: Option<usize>,
+    /// Saved editor content when browsing history.
+    pub saved_editor_content: Option<String>,
+    /// Is a query currently executing?
+    pub query_executing: bool,
+    /// Query start time for duration display.
+    pub query_start_time: Option<Instant>,
+    /// Last query result.
+    pub query_result: Option<QueryResultState>,
+    /// Show query results instead of table view.
+    pub show_query_results: bool,
 }
 
 impl std::fmt::Debug for App {
@@ -115,6 +159,8 @@ impl std::fmt::Debug for App {
             .field("current_view", &self.current_view)
             .field("tables", &self.tables)
             .field("selected_table_index", &self.selected_table_index)
+            .field("focused_pane", &self.focused_pane)
+            .field("query_executing", &self.query_executing)
             .finish()
     }
 }
@@ -131,6 +177,10 @@ impl App {
             let _ = sender.send(Event::App(AppEvent::ConnectionResult(result)));
         });
 
+        let mut sql_editor = TextArea::default();
+        sql_editor.set_cursor_line_style(ratatui::style::Style::default());
+        sql_editor.set_placeholder_text("-- type : to focus · Ctrl+Enter to run");
+
         Self {
             running: true,
             connection: ConnectionState::Connecting,
@@ -139,6 +189,15 @@ impl App {
             selected_table_index: 0,
             events,
             refresh_handle: None,
+            focused_pane: FocusedPane::Navigation,
+            sql_editor,
+            query_history: VecDeque::new(),
+            history_index: None,
+            saved_editor_content: None,
+            query_executing: false,
+            query_start_time: None,
+            query_result: None,
+            show_query_results: false,
         }
     }
 
@@ -168,7 +227,6 @@ impl App {
             AppEvent::Quit => self.quit(),
             AppEvent::ConnectionResult(result) => match result {
                 Ok((pool, db_name)) => {
-                    // Spawn task to fetch tables (initial fetch)
                     let sender = self.events.sender();
                     let pool_clone = pool.clone();
                     tokio::spawn(async move {
@@ -185,9 +243,7 @@ impl App {
                 }
             },
             AppEvent::TablesLoaded(new_tables) => {
-                // Only update if tables have changed
                 if self.tables != new_tables {
-                    // Try to preserve selection by table name
                     let previously_selected = self
                         .tables
                         .get(self.selected_table_index)
@@ -195,7 +251,6 @@ impl App {
 
                     self.tables = new_tables;
 
-                    // Find the previously selected table in the new list
                     if let Some(prev_name) = previously_selected {
                         if let Some(new_index) = self.tables.iter().position(|t| t == &prev_name) {
                             self.selected_table_index = new_index;
@@ -213,7 +268,6 @@ impl App {
                     debug!("refreshed table list – {} tables", self.tables.len());
                 }
 
-                // Start the refresh task if not already running
                 if self.refresh_handle.is_none() {
                     self.start_refresh_task();
                 }
@@ -221,7 +275,6 @@ impl App {
             AppEvent::TableDataLoaded(result) => {
                 match result {
                     Ok(data) => {
-                        // Only update if we're still viewing the same table
                         if let CurrentView::TableView(ref mut state) = self.current_view
                             && state.table_name == data.table_name
                             && state.page == data.page
@@ -231,7 +284,6 @@ impl App {
                             state.total_count = data.total_count;
                             state.loading = false;
                             state.error = None;
-                            // Reset selection if out of bounds
                             if state.selected_row >= state.rows.len() && !state.rows.is_empty() {
                                 state.selected_row = state.rows.len() - 1;
                             }
@@ -242,6 +294,37 @@ impl App {
                             state.loading = false;
                             state.error = Some(error);
                         }
+                    }
+                }
+            }
+            AppEvent::QueryExecuted(result) => {
+                self.query_executing = false;
+                self.query_start_time = None;
+
+                match result {
+                    Ok(qr) => {
+                        self.query_result = Some(QueryResultState {
+                            columns: qr.columns,
+                            rows: qr.rows,
+                            row_count: qr.row_count,
+                            duration_ms: qr.duration_ms,
+                            is_explain: qr.is_explain,
+                            selected_row: 0,
+                            error: None,
+                        });
+                        self.show_query_results = true;
+                    }
+                    Err(error) => {
+                        self.query_result = Some(QueryResultState {
+                            columns: Vec::new(),
+                            rows: Vec::new(),
+                            row_count: 0,
+                            duration_ms: 0,
+                            is_explain: false,
+                            selected_row: 0,
+                            error: Some(error),
+                        });
+                        self.show_query_results = true;
                     }
                 }
             }
@@ -296,9 +379,43 @@ impl App {
         }
     }
 
+    /// Execute SQL query.
+    fn execute_query(&mut self) {
+        let query = self.sql_editor.lines().join("\n").trim().to_string();
+        if query.is_empty() {
+            return;
+        }
+
+        // Add to history
+        if self.query_history.front() != Some(&query) {
+            self.query_history.push_front(query.clone());
+            if self.query_history.len() > MAX_HISTORY {
+                self.query_history.pop_back();
+            }
+        }
+        self.history_index = None;
+        self.saved_editor_content = None;
+
+        if let ConnectionState::Connected { pool, .. } = &self.connection {
+            let pool = pool.clone();
+            let sender = self.events.sender();
+
+            self.query_executing = true;
+            self.query_start_time = Some(Instant::now());
+
+            info!("Executing query: {}", query);
+
+            tokio::spawn(async move {
+                let result = execute_sql_query(&pool, &query).await;
+                let _ = sender.send(Event::App(AppEvent::QueryExecuted(result)));
+            });
+        }
+    }
+
     /// Open a table for viewing.
     fn open_table(&mut self, table_name: &str) {
         info!("Opening table: {}", table_name);
+        self.show_query_results = false;
 
         let state = TableViewState {
             table_name: table_name.to_string(),
@@ -317,7 +434,7 @@ impl App {
 
     /// Handles the key events and updates the state of [`App`].
     pub fn handle_key_events(&mut self, key_event: KeyEvent) -> color_eyre::Result<()> {
-        // Global quit shortcuts
+        // Global quit with Ctrl+C
         if matches!(key_event.code, KeyCode::Char('c') | KeyCode::Char('C'))
             && key_event.modifiers == KeyModifiers::CONTROL
         {
@@ -325,7 +442,147 @@ impl App {
             return Ok(());
         }
 
-        // Track if we need to fetch new page data
+        // Handle based on focused pane
+        match self.focused_pane {
+            FocusedPane::SqlEditor => self.handle_editor_keys(key_event),
+            FocusedPane::Navigation => self.handle_navigation_keys(key_event),
+        }
+    }
+
+    /// Handle keys when SQL editor is focused.
+    fn handle_editor_keys(&mut self, key_event: KeyEvent) -> color_eyre::Result<()> {
+        // Debug: log key events to help diagnose
+        debug!(
+            "Editor key: code={:?} modifiers={:?}",
+            key_event.code, key_event.modifiers
+        );
+
+        // Check if this is an "execute query" key combination
+        let is_execute_key = self.is_execute_key_combo(&key_event);
+
+        if is_execute_key {
+            debug!("Execute key combo detected!");
+            if !self.query_executing {
+                self.execute_query();
+            }
+            return Ok(());
+        }
+
+        // Escape to go back to navigation
+        if key_event.code == KeyCode::Esc {
+            self.focused_pane = FocusedPane::Navigation;
+            return Ok(());
+        }
+
+        // History navigation with Up/Down when editor is empty or at boundaries
+        if key_event.code == KeyCode::Up && key_event.modifiers.is_empty() {
+            let (row, _) = self.sql_editor.cursor();
+            if row == 0 && !self.query_history.is_empty() {
+                self.navigate_history_up();
+                return Ok(());
+            }
+        }
+
+        if key_event.code == KeyCode::Down && key_event.modifiers.is_empty() {
+            let (row, _) = self.sql_editor.cursor();
+            let line_count = self.sql_editor.lines().len();
+            if row >= line_count.saturating_sub(1) && self.history_index.is_some() {
+                self.navigate_history_down();
+                return Ok(());
+            }
+        }
+
+        // Pass other keys to the text area
+        self.sql_editor.input(key_event);
+        Ok(())
+    }
+
+    /// Check if the key event is an "execute query" combination.
+    /// Supports multiple key combos for cross-platform compatibility:
+    /// - Ctrl+Enter (standard)
+    /// - Cmd+Enter (macOS)
+    /// - Ctrl+J (Enter is often Ctrl+J / \n)
+    /// - F5 (common in SQL tools)
+    fn is_execute_key_combo(&self, key_event: &KeyEvent) -> bool {
+        let ctrl = key_event.modifiers.contains(KeyModifiers::CONTROL);
+        let cmd = key_event.modifiers.contains(KeyModifiers::SUPER);
+        let shift = key_event.modifiers.contains(KeyModifiers::SHIFT);
+
+        match key_event.code {
+            // Ctrl+Enter or Cmd+Enter
+            KeyCode::Enter if ctrl || cmd => true,
+            // Ctrl+J (Enter equivalent on Unix - \n is Ctrl+J)
+            KeyCode::Char('j') | KeyCode::Char('J') if ctrl => true,
+            // Shift+Enter as alternative
+            KeyCode::Enter if shift => true,
+            // F5 (common SQL execute key)
+            KeyCode::F(5) => true,
+            _ => false,
+        }
+    }
+
+    /// Navigate up in query history.
+    fn navigate_history_up(&mut self) {
+        if self.query_history.is_empty() {
+            return;
+        }
+
+        // Save current content if just starting to browse
+        if self.history_index.is_none() {
+            self.saved_editor_content = Some(self.sql_editor.lines().join("\n"));
+        }
+
+        let new_index = match self.history_index {
+            None => 0,
+            Some(i) => (i + 1).min(self.query_history.len() - 1),
+        };
+
+        self.history_index = Some(new_index);
+
+        if let Some(query) = self.query_history.get(new_index) {
+            self.sql_editor = TextArea::new(query.lines().map(String::from).collect());
+            self.sql_editor.set_cursor_line_style(ratatui::style::Style::default());
+        }
+    }
+
+    /// Navigate down in query history.
+    fn navigate_history_down(&mut self) {
+        match self.history_index {
+            None => {}
+            Some(0) => {
+                // Return to saved content
+                self.history_index = None;
+                if let Some(content) = self.saved_editor_content.take() {
+                    self.sql_editor = TextArea::new(content.lines().map(String::from).collect());
+                    self.sql_editor.set_cursor_line_style(ratatui::style::Style::default());
+                }
+            }
+            Some(i) => {
+                let new_index = i - 1;
+                self.history_index = Some(new_index);
+                if let Some(query) = self.query_history.get(new_index) {
+                    self.sql_editor = TextArea::new(query.lines().map(String::from).collect());
+                    self.sql_editor.set_cursor_line_style(ratatui::style::Style::default());
+                }
+            }
+        }
+    }
+
+    /// Handle keys when navigation pane is focused.
+    fn handle_navigation_keys(&mut self, key_event: KeyEvent) -> color_eyre::Result<()> {
+        // ':' to focus SQL editor
+        if key_event.code == KeyCode::Char(':') {
+            self.focused_pane = FocusedPane::SqlEditor;
+            return Ok(());
+        }
+
+        // Clear query results with 'c'
+        if key_event.code == KeyCode::Char('c') && self.show_query_results {
+            self.show_query_results = false;
+            self.query_result = None;
+            return Ok(());
+        }
+
         let mut fetch_page: Option<(String, usize)> = None;
 
         match &mut self.current_view {
@@ -335,10 +592,20 @@ impl App {
                 }
             }
             CurrentView::TableList => {
-                match key_event.code {
-                    KeyCode::Esc | KeyCode::Char('q') => self.events.send(AppEvent::Quit),
+        match key_event.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.events.send(AppEvent::Quit),
                     KeyCode::Up | KeyCode::Char('k') => {
-                        if !self.tables.is_empty() {
+                        if self.show_query_results {
+                            if let Some(ref mut qr) = self.query_result
+                                && !qr.rows.is_empty()
+                            {
+                                if qr.selected_row > 0 {
+                                    qr.selected_row -= 1;
+                                } else {
+                                    qr.selected_row = qr.rows.len() - 1;
+                                }
+                            }
+                        } else if !self.tables.is_empty() {
                             if self.selected_table_index > 0 {
                                 self.selected_table_index -= 1;
                             } else {
@@ -347,7 +614,17 @@ impl App {
                         }
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
-                        if !self.tables.is_empty() {
+                        if self.show_query_results {
+                            if let Some(ref mut qr) = self.query_result
+                                && !qr.rows.is_empty()
+                            {
+                                if qr.selected_row < qr.rows.len() - 1 {
+                                    qr.selected_row += 1;
+                                } else {
+                                    qr.selected_row = 0;
+                                }
+                            }
+                        } else if !self.tables.is_empty() {
                             if self.selected_table_index < self.tables.len() - 1 {
                                 self.selected_table_index += 1;
                             } else {
@@ -367,12 +644,22 @@ impl App {
             CurrentView::TableView(state) => {
                 match key_event.code {
                     KeyCode::Esc | KeyCode::Char('b') => {
-                        // Go back to table list
                         self.current_view = CurrentView::TableList;
+                        self.show_query_results = false;
                     }
                     KeyCode::Char('q') => self.events.send(AppEvent::Quit),
                     KeyCode::Up | KeyCode::Char('k') => {
-                        if !state.rows.is_empty() {
+                        if self.show_query_results {
+                            if let Some(ref mut qr) = self.query_result
+                                && !qr.rows.is_empty()
+                            {
+                                if qr.selected_row > 0 {
+                                    qr.selected_row -= 1;
+                                } else {
+                                    qr.selected_row = qr.rows.len() - 1;
+                                }
+                            }
+                        } else if !state.rows.is_empty() {
                             if state.selected_row > 0 {
                                 state.selected_row -= 1;
                             } else {
@@ -381,7 +668,17 @@ impl App {
                         }
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
-                        if !state.rows.is_empty() {
+                        if self.show_query_results {
+                            if let Some(ref mut qr) = self.query_result
+                                && !qr.rows.is_empty()
+                            {
+                                if qr.selected_row < qr.rows.len() - 1 {
+                                    qr.selected_row += 1;
+                                } else {
+                                    qr.selected_row = 0;
+                                }
+                            }
+                        } else if !state.rows.is_empty() {
                             if state.selected_row < state.rows.len() - 1 {
                                 state.selected_row += 1;
                             } else {
@@ -390,8 +687,7 @@ impl App {
                         }
                     }
                     KeyCode::Left | KeyCode::Char('h') => {
-                        // Previous page
-                        if state.page > 0 && !state.loading {
+                        if !self.show_query_results && state.page > 0 && !state.loading {
                             state.page -= 1;
                             state.loading = true;
                             state.selected_row = 0;
@@ -399,21 +695,21 @@ impl App {
                         }
                     }
                     KeyCode::Right | KeyCode::Char('l') => {
-                        // Next page
-                        let total_pages = state.total_pages();
-                        if state.page < total_pages.saturating_sub(1) && !state.loading {
-                            state.page += 1;
-                            state.loading = true;
-                            state.selected_row = 0;
-                            fetch_page = Some((state.table_name.clone(), state.page));
+                        if !self.show_query_results {
+                            let total_pages = state.total_pages();
+                            if state.page < total_pages.saturating_sub(1) && !state.loading {
+                                state.page += 1;
+                                state.loading = true;
+                                state.selected_row = 0;
+                                fetch_page = Some((state.table_name.clone(), state.page));
+                            }
                         }
                     }
-                    _ => {}
+            _ => {}
                 }
             }
         }
 
-        // Fetch page data outside the match to avoid borrow issues
         if let Some((table_name, page)) = fetch_page {
             self.fetch_table_data(&table_name, page);
         }
@@ -427,6 +723,11 @@ impl App {
     /// Set running to false to quit the application.
     pub fn quit(&mut self) {
         self.running = false;
+    }
+
+    /// Get elapsed query time in ms.
+    pub fn query_elapsed_ms(&self) -> Option<u128> {
+        self.query_start_time.map(|t| t.elapsed().as_millis())
     }
 }
 
@@ -477,14 +778,12 @@ async fn fetch_table_page(
 ) -> Result<TableDataResult, String> {
     let offset = page * PAGE_SIZE;
 
-    // Fetch total count
     let count_query = format!(r#"SELECT COUNT(*) FROM "{}""#, table_name);
     let total_count: (i64,) = sqlx::query_as(&count_query)
         .fetch_one(pool)
         .await
         .map_err(|e| format!("Failed to get row count: {e}"))?;
 
-    // Fetch rows with columns
     let data_query = format!(
         r#"SELECT * FROM "{}" LIMIT {} OFFSET {}"#,
         table_name, PAGE_SIZE, offset
@@ -495,9 +794,7 @@ async fn fetch_table_page(
         .await
         .map_err(|e| format!("Failed to fetch data: {e}"))?;
 
-    // Extract column names from the first row or query metadata
     let columns: Vec<String> = if rows.is_empty() {
-        // If no rows, we need to get columns from table info
         let columns_query = format!(
             r#"SELECT column_name FROM information_schema.columns 
                WHERE table_schema = 'public' AND table_name = '{}' 
@@ -517,44 +814,9 @@ async fn fetch_table_page(
             .collect()
     };
 
-    // Convert rows to Vec<Vec<String>>
     let string_rows: Vec<Vec<String>> = rows
         .iter()
-        .map(|row| {
-            columns
-                .iter()
-                .enumerate()
-                .map(|(i, _)| {
-                    // Try to get value as string, handle various types
-                    row.try_get::<String, _>(i)
-                        .or_else(|_| row.try_get::<i64, _>(i).map(|v| v.to_string()))
-                        .or_else(|_| row.try_get::<i32, _>(i).map(|v| v.to_string()))
-                        .or_else(|_| row.try_get::<f64, _>(i).map(|v| v.to_string()))
-                        .or_else(|_| row.try_get::<bool, _>(i).map(|v| v.to_string()))
-                        .or_else(|_| {
-                            row.try_get::<Option<String>, _>(i)
-                                .map(|v| v.unwrap_or_else(|| "NULL".to_string()))
-                        })
-                        .or_else(|_| {
-                            row.try_get::<Option<i64>, _>(i)
-                                .map(|v| v.map_or("NULL".to_string(), |n| n.to_string()))
-                        })
-                        .or_else(|_| {
-                            row.try_get::<Option<i32>, _>(i)
-                                .map(|v| v.map_or("NULL".to_string(), |n| n.to_string()))
-                        })
-                        .or_else(|_| {
-                            row.try_get::<Option<f64>, _>(i)
-                                .map(|v| v.map_or("NULL".to_string(), |n| n.to_string()))
-                        })
-                        .or_else(|_| {
-                            row.try_get::<Option<bool>, _>(i)
-                                .map(|v| v.map_or("NULL".to_string(), |b| b.to_string()))
-                        })
-                        .unwrap_or_else(|_| "<?>".to_string())
-                })
-                .collect()
-        })
+        .map(|row| row_to_strings(row, columns.len()))
         .collect();
 
     Ok(TableDataResult {
@@ -564,4 +826,77 @@ async fn fetch_table_page(
         total_count: total_count.0,
         page,
     })
+}
+
+/// Execute a SQL query and return results.
+async fn execute_sql_query(pool: &PgPool, query: &str) -> Result<QueryResult, String> {
+    let start = Instant::now();
+    let is_explain = query.trim().to_uppercase().starts_with("EXPLAIN");
+
+    let rows = sqlx::query(query)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| format!("{e}"))?;
+
+    let duration_ms = start.elapsed().as_millis();
+
+    let columns: Vec<String> = if rows.is_empty() {
+        Vec::new()
+    } else {
+        rows[0]
+            .columns()
+            .iter()
+            .map(|c| c.name().to_string())
+            .collect()
+    };
+
+    let string_rows: Vec<Vec<String>> = rows
+        .iter()
+        .map(|row| row_to_strings(row, columns.len()))
+        .collect();
+
+    let row_count = string_rows.len();
+
+    Ok(QueryResult {
+        query: query.to_string(),
+        columns,
+        rows: string_rows,
+        row_count,
+        duration_ms,
+        is_explain,
+    })
+}
+
+/// Convert a database row to a vector of strings.
+fn row_to_strings(row: &sqlx::postgres::PgRow, col_count: usize) -> Vec<String> {
+    (0..col_count)
+        .map(|i| {
+            row.try_get::<String, _>(i)
+                .or_else(|_| row.try_get::<i64, _>(i).map(|v| v.to_string()))
+                .or_else(|_| row.try_get::<i32, _>(i).map(|v| v.to_string()))
+                .or_else(|_| row.try_get::<f64, _>(i).map(|v| v.to_string()))
+                .or_else(|_| row.try_get::<bool, _>(i).map(|v| v.to_string()))
+                .or_else(|_| {
+                    row.try_get::<Option<String>, _>(i)
+                        .map(|v| v.unwrap_or_else(|| "NULL".to_string()))
+                })
+                .or_else(|_| {
+                    row.try_get::<Option<i64>, _>(i)
+                        .map(|v| v.map_or("NULL".to_string(), |n| n.to_string()))
+                })
+                .or_else(|_| {
+                    row.try_get::<Option<i32>, _>(i)
+                        .map(|v| v.map_or("NULL".to_string(), |n| n.to_string()))
+                })
+                .or_else(|_| {
+                    row.try_get::<Option<f64>, _>(i)
+                        .map(|v| v.map_or("NULL".to_string(), |n| n.to_string()))
+                })
+                .or_else(|_| {
+                    row.try_get::<Option<bool>, _>(i)
+                        .map(|v| v.map_or("NULL".to_string(), |b| b.to_string()))
+                })
+                .unwrap_or_else(|_| "<?>".to_string())
+        })
+        .collect()
 }
