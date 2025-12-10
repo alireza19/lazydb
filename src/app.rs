@@ -6,7 +6,9 @@ use ratatui::{
 };
 use sqlx::PgPool;
 use std::env;
-use tracing::info;
+use std::time::Duration;
+use tokio::task::JoinHandle;
+use tracing::{debug, info};
 
 /// A lazydocker-inspired database TUI
 #[derive(Parser, Debug)]
@@ -64,6 +66,8 @@ pub struct App {
     pub selected_table_index: usize,
     /// Event handler.
     pub events: EventHandler,
+    /// Handle for the background refresh task.
+    refresh_handle: Option<JoinHandle<()>>,
 }
 
 impl std::fmt::Debug for App {
@@ -97,6 +101,7 @@ impl App {
             tables: Vec::new(),
             selected_table_index: 0,
             events,
+            refresh_handle: None,
         }
     }
 
@@ -126,7 +131,7 @@ impl App {
             AppEvent::Quit => self.quit(),
             AppEvent::ConnectionResult(result) => match result {
                 Ok((pool, db_name)) => {
-                    // Spawn task to fetch tables
+                    // Spawn task to fetch tables (initial fetch)
                     let sender = self.events.sender();
                     let pool_clone = pool.clone();
                     tokio::spawn(async move {
@@ -142,10 +147,80 @@ impl App {
                     self.current_view = CurrentView::ConnectionStatus;
                 }
             },
-            AppEvent::TablesLoaded(tables) => {
-                self.tables = tables;
-                self.selected_table_index = 0;
+            AppEvent::TablesLoaded(new_tables) => {
+                // Only update if tables have changed
+                if self.tables != new_tables {
+                    // Try to preserve selection by table name
+                    let previously_selected = self
+                        .tables
+                        .get(self.selected_table_index)
+                        .cloned();
+
+                    self.tables = new_tables;
+
+                    // Find the previously selected table in the new list
+                    if let Some(prev_name) = previously_selected {
+                        if let Some(new_index) = self.tables.iter().position(|t| t == &prev_name) {
+                            self.selected_table_index = new_index;
+                        } else {
+                            // Table no longer exists, reset to 0
+                            self.selected_table_index = 0;
+                        }
+                    } else {
+                        self.selected_table_index = 0;
+                    }
+
+                    // Ensure index is valid for empty list
+                    if self.tables.is_empty() {
+                        self.selected_table_index = 0;
+                    }
+
+                    debug!("refreshed table list – {} tables", self.tables.len());
+                }
+
+                // Start the refresh task if not already running
+                if self.refresh_handle.is_none() {
+                    self.start_refresh_task();
+                }
             }
+        }
+    }
+
+    /// Start the background refresh task.
+    fn start_refresh_task(&mut self) {
+        if let ConnectionState::Connected { pool, .. } = &self.connection {
+            let pool = pool.clone();
+            let sender = self.events.sender();
+
+            let handle = tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(3));
+                // Skip the first tick (immediate)
+                interval.tick().await;
+
+                loop {
+                    interval.tick().await;
+
+                    // Check if the sender is closed (app is shutting down)
+                    if sender.is_closed() {
+                        debug!("refresh task stopping – channel closed");
+                        break;
+                    }
+
+                    // Check if pool is still usable
+                    if pool.is_closed() {
+                        debug!("refresh task stopping – pool closed");
+                        break;
+                    }
+
+                    let tables = fetch_tables(&pool).await;
+                    if sender.send(Event::App(AppEvent::TablesLoaded(tables))).is_err() {
+                        // Channel closed, stop the task
+                        break;
+                    }
+                }
+            });
+
+            self.refresh_handle = Some(handle);
         }
     }
 
@@ -191,6 +266,15 @@ impl App {
     /// Set running to false to quit the application.
     pub fn quit(&mut self) {
         self.running = false;
+    }
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        // Abort the refresh task if it's running
+        if let Some(handle) = self.refresh_handle.take() {
+            handle.abort();
+        }
     }
 }
 
