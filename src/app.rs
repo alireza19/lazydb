@@ -116,10 +116,41 @@ pub enum CurrentView {
 /// Which pane has focus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FocusedPane {
-    /// Sidebar/results navigation.
-    Navigation,
-    /// SQL editor.
-    SqlEditor,
+    /// Left sidebar (table list).
+    Sidebar,
+    /// Right results grid (table data or query results).
+    Results,
+    /// Bottom SQL editor.
+    Editor,
+}
+
+impl FocusedPane {
+    /// Cycle to next pane (Tab).
+    pub fn next(self) -> Self {
+        match self {
+            FocusedPane::Sidebar => FocusedPane::Results,
+            FocusedPane::Results => FocusedPane::Editor,
+            FocusedPane::Editor => FocusedPane::Sidebar,
+        }
+    }
+
+    /// Cycle to previous pane (Shift+Tab).
+    pub fn prev(self) -> Self {
+        match self {
+            FocusedPane::Sidebar => FocusedPane::Editor,
+            FocusedPane::Results => FocusedPane::Sidebar,
+            FocusedPane::Editor => FocusedPane::Results,
+        }
+    }
+
+    /// Display name for footer.
+    pub fn label(self) -> &'static str {
+        match self {
+            FocusedPane::Sidebar => "Sidebar",
+            FocusedPane::Results => "Results",
+            FocusedPane::Editor => "Editor",
+        }
+    }
 }
 
 /// SQL query result state for display.
@@ -226,7 +257,7 @@ impl App {
             selected_table_index: 0,
             events,
             refresh_handle: None,
-            focused_pane: FocusedPane::Navigation,
+            focused_pane: FocusedPane::Sidebar,
             sql_editor,
             query_history: VecDeque::new(),
             history_index: None,
@@ -482,10 +513,33 @@ impl App {
             return Ok(());
         }
 
+        // Tab cycles forward, Shift+Tab cycles backward
+        if key_event.code == KeyCode::Tab {
+            if key_event.modifiers.contains(KeyModifiers::SHIFT) {
+                self.focused_pane = self.focused_pane.prev();
+            } else {
+                self.focused_pane = self.focused_pane.next();
+            }
+            return Ok(());
+        }
+
+        // BackTab (Shift+Tab on some terminals)
+        if key_event.code == KeyCode::BackTab {
+            self.focused_pane = self.focused_pane.prev();
+            return Ok(());
+        }
+
+        // ':' always jumps to editor from anywhere
+        if key_event.code == KeyCode::Char(':') && self.focused_pane != FocusedPane::Editor {
+            self.focused_pane = FocusedPane::Editor;
+            return Ok(());
+        }
+
         // Handle based on focused pane
         match self.focused_pane {
-            FocusedPane::SqlEditor => self.handle_editor_keys(key_event),
-            FocusedPane::Navigation => self.handle_navigation_keys(key_event),
+            FocusedPane::Editor => self.handle_editor_keys(key_event),
+            FocusedPane::Sidebar => self.handle_sidebar_keys(key_event),
+            FocusedPane::Results => self.handle_results_keys(key_event),
         }
     }
 
@@ -508,9 +562,13 @@ impl App {
             return Ok(());
         }
 
-        // Escape to go back to navigation
+        // Escape to go back to results (or sidebar if no results)
         if key_event.code == KeyCode::Esc {
-            self.focused_pane = FocusedPane::Navigation;
+            self.focused_pane = if self.show_query_results || matches!(self.current_view, CurrentView::TableView(_)) {
+                FocusedPane::Results
+            } else {
+                FocusedPane::Sidebar
+            };
             return Ok(());
         }
 
@@ -609,13 +667,45 @@ impl App {
     }
 
     /// Handle keys when navigation pane is focused.
-    fn handle_navigation_keys(&mut self, key_event: KeyEvent) -> color_eyre::Result<()> {
-        // ':' to focus SQL editor
-        if key_event.code == KeyCode::Char(':') {
-            self.focused_pane = FocusedPane::SqlEditor;
-            return Ok(());
+    /// Handle keys when sidebar (table list) is focused.
+    fn handle_sidebar_keys(&mut self, key_event: KeyEvent) -> color_eyre::Result<()> {
+        match key_event.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.events.send(AppEvent::Quit);
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if !self.tables.is_empty() {
+                    if self.selected_table_index > 0 {
+                        self.selected_table_index -= 1;
+                    } else {
+                        self.selected_table_index = self.tables.len() - 1;
+                    }
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if !self.tables.is_empty() {
+                    if self.selected_table_index < self.tables.len() - 1 {
+                        self.selected_table_index += 1;
+                    } else {
+                        self.selected_table_index = 0;
+                    }
+                }
+            }
+            KeyCode::Enter => {
+                if !self.tables.is_empty() {
+                    let table_name = self.tables[self.selected_table_index].clone();
+                    self.open_table(&table_name);
+                    // Focus results after opening table
+                    self.focused_pane = FocusedPane::Results;
+                }
+            }
+            _ => {}
         }
+        Ok(())
+    }
 
+    /// Handle keys when results pane is focused.
+    fn handle_results_keys(&mut self, key_event: KeyEvent) -> color_eyre::Result<()> {
         // Clear query results with 'c'
         if key_event.code == KeyCode::Char('c') && self.show_query_results {
             self.show_query_results = false;
@@ -623,145 +713,95 @@ impl App {
             return Ok(());
         }
 
+        // 'b' or Esc goes back to table list
+        if matches!(key_event.code, KeyCode::Char('b') | KeyCode::Esc) {
+            if matches!(self.current_view, CurrentView::TableView(_)) {
+                self.current_view = CurrentView::TableList;
+                self.show_query_results = false;
+                self.focused_pane = FocusedPane::Sidebar;
+            }
+            return Ok(());
+        }
+
+        if key_event.code == KeyCode::Char('q') {
+            self.events.send(AppEvent::Quit);
+            return Ok(());
+        }
+
         let mut fetch_page: Option<(String, usize)> = None;
 
-        match &mut self.current_view {
-            CurrentView::ConnectionStatus => {
-                if matches!(key_event.code, KeyCode::Esc | KeyCode::Char('q')) {
-                    self.events.send(AppEvent::Quit);
-                }
-            }
-            CurrentView::TableList => {
+        // Handle query results navigation
+        if self.show_query_results {
+            if let Some(ref mut qr) = self.query_result
+                && !qr.rows.is_empty()
+            {
                 match key_event.code {
-                    KeyCode::Esc | KeyCode::Char('q') => self.events.send(AppEvent::Quit),
                     KeyCode::Up | KeyCode::Char('k') => {
-                        if self.show_query_results {
-                            if let Some(ref mut qr) = self.query_result
-                                && !qr.rows.is_empty()
-                            {
-                                if qr.selected_row > 0 {
-                                    qr.selected_row -= 1;
-                                } else {
-                                    qr.selected_row = qr.rows.len() - 1;
-                                    // Jump to end - reset scroll to show selection
-                                    qr.scroll_offset = qr.rows.len().saturating_sub(DEFAULT_VISIBLE_ROWS);
-                                }
-                                qr.ensure_visible(DEFAULT_VISIBLE_ROWS);
-                            }
-                        } else if !self.tables.is_empty() {
-                            if self.selected_table_index > 0 {
-                                self.selected_table_index -= 1;
-                            } else {
-                                self.selected_table_index = self.tables.len() - 1;
-                            }
+                        if qr.selected_row > 0 {
+                            qr.selected_row -= 1;
+                        } else {
+                            qr.selected_row = qr.rows.len() - 1;
+                            qr.scroll_offset = qr.rows.len().saturating_sub(DEFAULT_VISIBLE_ROWS);
                         }
+                        qr.ensure_visible(DEFAULT_VISIBLE_ROWS);
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
-                        if self.show_query_results {
-                            if let Some(ref mut qr) = self.query_result
-                                && !qr.rows.is_empty()
-                            {
-                                if qr.selected_row < qr.rows.len() - 1 {
-                                    qr.selected_row += 1;
-                                } else {
-                                    qr.selected_row = 0;
-                                    qr.scroll_offset = 0; // Jump to beginning
-                                }
-                                qr.ensure_visible(DEFAULT_VISIBLE_ROWS);
-                            }
-                        } else if !self.tables.is_empty() {
-                            if self.selected_table_index < self.tables.len() - 1 {
-                                self.selected_table_index += 1;
-                            } else {
-                                self.selected_table_index = 0;
-                            }
+                        if qr.selected_row < qr.rows.len() - 1 {
+                            qr.selected_row += 1;
+                        } else {
+                            qr.selected_row = 0;
+                            qr.scroll_offset = 0;
                         }
-                    }
-                    KeyCode::Enter => {
-                        if !self.tables.is_empty() {
-                            let table_name = self.tables[self.selected_table_index].clone();
-                            self.open_table(&table_name);
-                        }
+                        qr.ensure_visible(DEFAULT_VISIBLE_ROWS);
                     }
                     _ => {}
                 }
             }
-            CurrentView::TableView(state) => {
-                match key_event.code {
-                    KeyCode::Esc | KeyCode::Char('b') => {
-                        self.current_view = CurrentView::TableList;
-                        self.show_query_results = false;
-                    }
-                    KeyCode::Char('q') => self.events.send(AppEvent::Quit),
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        if self.show_query_results {
-                            if let Some(ref mut qr) = self.query_result
-                                && !qr.rows.is_empty()
-                            {
-                                if qr.selected_row > 0 {
-                                    qr.selected_row -= 1;
-                                } else {
-                                    qr.selected_row = qr.rows.len() - 1;
-                                    qr.scroll_offset = qr.rows.len().saturating_sub(DEFAULT_VISIBLE_ROWS);
-                                }
-                                qr.ensure_visible(DEFAULT_VISIBLE_ROWS);
-                            }
-                        } else if !state.rows.is_empty() {
-                            if state.selected_row > 0 {
-                                state.selected_row -= 1;
-                            } else {
-                                state.selected_row = state.rows.len() - 1;
-                                state.scroll_offset = state.rows.len().saturating_sub(DEFAULT_VISIBLE_ROWS);
-                            }
-                            state.ensure_visible(DEFAULT_VISIBLE_ROWS);
+        } else if let CurrentView::TableView(state) = &mut self.current_view {
+            // Handle table view navigation
+            match key_event.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if !state.rows.is_empty() {
+                        if state.selected_row > 0 {
+                            state.selected_row -= 1;
+                        } else {
+                            state.selected_row = state.rows.len() - 1;
+                            state.scroll_offset = state.rows.len().saturating_sub(DEFAULT_VISIBLE_ROWS);
                         }
+                        state.ensure_visible(DEFAULT_VISIBLE_ROWS);
                     }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        if self.show_query_results {
-                            if let Some(ref mut qr) = self.query_result
-                                && !qr.rows.is_empty()
-                            {
-                                if qr.selected_row < qr.rows.len() - 1 {
-                                    qr.selected_row += 1;
-                                } else {
-                                    qr.selected_row = 0;
-                                    qr.scroll_offset = 0;
-                                }
-                                qr.ensure_visible(DEFAULT_VISIBLE_ROWS);
-                            }
-                        } else if !state.rows.is_empty() {
-                            if state.selected_row < state.rows.len() - 1 {
-                                state.selected_row += 1;
-                            } else {
-                                state.selected_row = 0;
-                                state.scroll_offset = 0;
-                            }
-                            state.ensure_visible(DEFAULT_VISIBLE_ROWS);
-                        }
-                    }
-                    KeyCode::Left | KeyCode::Char('h') => {
-                        if !self.show_query_results && state.page > 0 && !state.loading {
-                            state.page -= 1;
-                            state.loading = true;
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if !state.rows.is_empty() {
+                        if state.selected_row < state.rows.len() - 1 {
+                            state.selected_row += 1;
+                        } else {
                             state.selected_row = 0;
                             state.scroll_offset = 0;
-                            fetch_page = Some((state.table_name.clone(), state.page));
                         }
+                        state.ensure_visible(DEFAULT_VISIBLE_ROWS);
                     }
-                    KeyCode::Right | KeyCode::Char('l') => {
-                        if !self.show_query_results {
-                            let total_pages = state.total_pages();
-                            if state.page < total_pages.saturating_sub(1) && !state.loading {
-                                state.page += 1;
-                                state.loading = true;
-                                state.selected_row = 0;
-                                state.scroll_offset = 0;
-                                fetch_page = Some((state.table_name.clone(), state.page));
-                            }
-                        }
-                    }
-                    _ => {}
                 }
+                KeyCode::Left | KeyCode::Char('h') => {
+                    if state.page > 0 && !state.loading {
+                        state.page -= 1;
+                        state.loading = true;
+                        state.selected_row = 0;
+                        state.scroll_offset = 0;
+                        fetch_page = Some((state.table_name.clone(), state.page));
+                    }
+                }
+                KeyCode::Right | KeyCode::Char('l') => {
+                    let total_pages = state.total_pages();
+                    if state.page < total_pages.saturating_sub(1) && !state.loading {
+                        state.page += 1;
+                        state.loading = true;
+                        state.selected_row = 0;
+                        state.scroll_offset = 0;
+                        fetch_page = Some((state.table_name.clone(), state.page));
+                    }
+                }
+                _ => {}
             }
         }
 

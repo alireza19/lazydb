@@ -131,9 +131,9 @@ fn render_sidebar(app: &App, area: Rect, buf: &mut Buffer) {
         _ => None,
     };
 
-    let is_focused = app.focused_pane == FocusedPane::Navigation && !app.show_query_results;
+    let is_focused = app.focused_pane == FocusedPane::Sidebar;
     let border_color = if is_focused {
-        Color::Cyan
+        Color::Yellow
     } else {
         Color::Rgb(60, 60, 60)
     };
@@ -147,6 +147,16 @@ fn render_sidebar(app: &App, area: Rect, buf: &mut Buffer) {
     let sidebar_inner = sidebar_block.inner(area);
     sidebar_block.render(area, buf);
 
+    // Split for list and footer
+    let layout = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .split(sidebar_inner);
+
+    let list_area = layout[0];
+    let footer_area = layout[1];
+
     if app.tables.is_empty() {
         let empty_text = Paragraph::new(Line::from(vec![Span::styled(
             "<empty>",
@@ -159,7 +169,7 @@ fn render_sidebar(app: &App, area: Rect, buf: &mut Buffer) {
             Constraint::Length(1),
             Constraint::Fill(1),
         ])
-        .split(sidebar_inner);
+        .split(list_area);
 
         empty_text.render(centered_layout[1], buf);
     } else {
@@ -178,7 +188,7 @@ fn render_sidebar(app: &App, area: Rect, buf: &mut Buffer) {
                         .add_modifier(Modifier::BOLD)
                 } else if is_selected {
                     Style::default()
-            .fg(Color::Cyan)
+                        .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::White)
@@ -195,8 +205,25 @@ fn render_sidebar(app: &App, area: Rect, buf: &mut Buffer) {
         let mut state = ListState::default();
         state.select(Some(app.selected_table_index));
 
-        ratatui::widgets::StatefulWidget::render(list, sidebar_inner, buf, &mut state);
+        ratatui::widgets::StatefulWidget::render(list, list_area, buf, &mut state);
     }
+
+    // Footer with focus indicator
+    let footer = Line::from(vec![
+        Span::styled(
+            format!("[{}]", app.focused_pane.label()),
+            Style::default().fg(Color::Yellow).bold(),
+        ),
+        Span::styled(" ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("{} tables", app.tables.len()),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+
+    Paragraph::new(footer)
+        .alignment(Alignment::Center)
+        .render(footer_area, buf);
 }
 
 /// Render the right content area.
@@ -215,9 +242,9 @@ fn render_content_area(app: &App, area: Rect, buf: &mut Buffer) {
 
 /// Render placeholder when no table is selected.
 fn render_placeholder(app: &App, area: Rect, buf: &mut Buffer) {
-    let is_focused = app.focused_pane == FocusedPane::Navigation;
+    let is_focused = app.focused_pane == FocusedPane::Results;
     let border_color = if is_focused {
-        Color::Rgb(80, 80, 100)
+        Color::Yellow
     } else {
         Color::Rgb(60, 60, 60)
     };
@@ -265,9 +292,9 @@ fn render_placeholder(app: &App, area: Rect, buf: &mut Buffer) {
 
 /// Render the table data view.
 fn render_table_view(state: &TableViewState, app: &App, area: Rect, buf: &mut Buffer) {
-    let is_focused = app.focused_pane == FocusedPane::Navigation;
+    let is_focused = app.focused_pane == FocusedPane::Results;
     let border_color = if is_focused {
-        Color::Rgb(80, 80, 100)
+        Color::Yellow
     } else {
         Color::Rgb(60, 60, 60)
     };
@@ -300,14 +327,14 @@ fn render_table_view(state: &TableViewState, app: &App, area: Rect, buf: &mut Bu
         render_data_table(&state.columns, &state.rows, state.selected_row, state.scroll_offset, table_area, buf);
     }
 
-    render_table_footer(state, footer_area, buf);
+    render_table_footer(state, app, footer_area, buf);
 }
 
 /// Render query results.
 fn render_query_results(qr: &QueryResultState, app: &App, area: Rect, buf: &mut Buffer) {
-    let is_focused = app.focused_pane == FocusedPane::Navigation;
+    let is_focused = app.focused_pane == FocusedPane::Results;
     let border_color = if is_focused {
-        Color::Rgb(80, 80, 100)
+        Color::Yellow
     } else {
         Color::Rgb(60, 60, 60)
     };
@@ -357,6 +384,12 @@ fn render_query_results(qr: &QueryResultState, app: &App, area: Rect, buf: &mut 
 
     // Footer
     let footer = Line::from(vec![
+        // Focus indicator
+        Span::styled(
+            format!("[{}]", app.focused_pane.label()),
+            Style::default().fg(Color::Yellow).bold(),
+        ),
+        Span::styled(" │ ", Style::default().fg(Color::Rgb(60, 60, 60))),
         Span::styled(
             format!("{} rows", qr.row_count),
             Style::default().fg(Color::Cyan),
@@ -367,12 +400,12 @@ fn render_query_results(qr: &QueryResultState, app: &App, area: Rect, buf: &mut 
             Style::default().fg(Color::Green),
         ),
         Span::styled(" │ ", Style::default().fg(Color::Rgb(60, 60, 60))),
+        Span::styled("Tab", Style::default().fg(Color::Cyan)),
+        Span::styled(" cycle  ", Style::default().fg(Color::DarkGray)),
         Span::styled("c", Style::default().fg(Color::Cyan)),
         Span::styled(" clear  ", Style::default().fg(Color::DarkGray)),
         Span::styled(":", Style::default().fg(Color::Cyan)),
-        Span::styled(" SQL  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("q", Style::default().fg(Color::Cyan)),
-        Span::styled(" quit", Style::default().fg(Color::DarkGray)),
+        Span::styled(" SQL", Style::default().fg(Color::DarkGray)),
     ]);
 
     Paragraph::new(footer)
@@ -511,11 +544,17 @@ pub fn visible_row_count(area: Rect) -> usize {
 }
 
 /// Render the table view footer.
-fn render_table_footer(state: &TableViewState, area: Rect, buf: &mut Buffer) {
+fn render_table_footer(state: &TableViewState, app: &App, area: Rect, buf: &mut Buffer) {
     let total_pages = state.total_pages();
     let current_page = state.page + 1;
 
-    let footer = Line::from(vec![
+    let spans = vec![
+        // Focus indicator
+        Span::styled(
+            format!("[{}]", app.focused_pane.label()),
+            Style::default().fg(Color::Yellow).bold(),
+        ),
+        Span::styled(" │ ", Style::default().fg(Color::Rgb(60, 60, 60))),
         Span::styled("Page ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             format!("{}", current_page),
@@ -532,17 +571,17 @@ fn render_table_footer(state: &TableViewState, area: Rect, buf: &mut Buffer) {
             Style::default().fg(Color::Cyan),
         ),
         Span::styled(" │ ", Style::default().fg(Color::Rgb(60, 60, 60))),
+        Span::styled("Tab", Style::default().fg(Color::Cyan)),
+        Span::styled(" cycle  ", Style::default().fg(Color::DarkGray)),
         Span::styled("←→", Style::default().fg(Color::Cyan)),
         Span::styled(" page  ", Style::default().fg(Color::DarkGray)),
         Span::styled("↑↓", Style::default().fg(Color::Cyan)),
         Span::styled(" row  ", Style::default().fg(Color::DarkGray)),
         Span::styled(":", Style::default().fg(Color::Cyan)),
-        Span::styled(" SQL  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("b", Style::default().fg(Color::Cyan)),
-        Span::styled(" back  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("q", Style::default().fg(Color::Cyan)),
-        Span::styled(" quit", Style::default().fg(Color::DarkGray)),
-    ]);
+        Span::styled(" SQL", Style::default().fg(Color::DarkGray)),
+    ];
+
+    let footer = Line::from(spans);
 
     Paragraph::new(footer)
         .alignment(Alignment::Center)
@@ -551,7 +590,7 @@ fn render_table_footer(state: &TableViewState, area: Rect, buf: &mut Buffer) {
 
 /// Render the SQL editor.
 fn render_sql_editor(app: &App, area: Rect, buf: &mut Buffer) {
-    let is_focused = app.focused_pane == FocusedPane::SqlEditor;
+    let is_focused = app.focused_pane == FocusedPane::Editor;
     let border_color = if is_focused {
         Color::Yellow
     } else {
@@ -640,14 +679,24 @@ fn render_sql_editor(app: &App, area: Rect, buf: &mut Buffer) {
         // Show running indicator
         let elapsed = app.query_elapsed_ms().unwrap_or(0);
         Line::from(vec![
+            Span::styled(
+                format!("[{}]", app.focused_pane.label()),
+                Style::default().fg(Color::Yellow).bold(),
+            ),
+            Span::styled(" │ ", Style::default().fg(Color::Rgb(60, 60, 60))),
             Span::styled("⟳ Running", Style::default().fg(Color::Yellow).bold()),
             Span::styled(format!(" {}ms...", elapsed), Style::default().fg(Color::Yellow)),
         ])
     } else {
         Line::from(vec![
+            Span::styled(
+                format!("[{}]", app.focused_pane.label()),
+                Style::default().fg(Color::Yellow).bold(),
+            ),
+            Span::styled(" │ ", Style::default().fg(Color::Rgb(60, 60, 60))),
+            Span::styled("Tab", Style::default().fg(Color::Cyan)),
+            Span::styled(" cycle  ", Style::default().fg(Color::DarkGray)),
             Span::styled("F5", Style::default().fg(Color::Cyan)),
-            Span::styled("/", Style::default().fg(Color::DarkGray)),
-            Span::styled("Ctrl+J", Style::default().fg(Color::Cyan)),
             Span::styled("/", Style::default().fg(Color::DarkGray)),
             Span::styled("Shift+Enter", Style::default().fg(Color::Cyan)),
             Span::styled(" run  ", Style::default().fg(Color::DarkGray)),
