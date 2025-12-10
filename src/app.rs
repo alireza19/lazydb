@@ -18,6 +18,10 @@ pub const PAGE_SIZE: usize = 50;
 /// Maximum query history size.
 pub const MAX_HISTORY: usize = 20;
 
+/// Default visible rows for scroll calculations.
+/// This is a conservative estimate; actual visible rows depend on terminal size.
+pub const DEFAULT_VISIBLE_ROWS: usize = 15;
+
 /// A lazydocker-inspired database TUI
 #[derive(Parser, Debug)]
 #[command(name = "lazydb")]
@@ -66,6 +70,8 @@ pub struct TableViewState {
     pub page: usize,
     /// Currently selected row index within the page.
     pub selected_row: usize,
+    /// Scroll offset for the visible window.
+    pub scroll_offset: usize,
     /// Loading state.
     pub loading: bool,
     /// Error message if fetch failed.
@@ -79,6 +85,19 @@ impl TableViewState {
             1
         } else {
             (self.total_count as usize).div_ceil(PAGE_SIZE)
+        }
+    }
+
+    /// Update scroll offset to keep selected row visible.
+    pub fn ensure_visible(&mut self, visible_rows: usize) {
+        if visible_rows == 0 {
+            return;
+        }
+        if self.selected_row < self.scroll_offset {
+            self.scroll_offset = self.selected_row;
+        }
+        if self.selected_row >= self.scroll_offset + visible_rows {
+            self.scroll_offset = self.selected_row.saturating_sub(visible_rows - 1);
         }
     }
 }
@@ -112,7 +131,25 @@ pub struct QueryResultState {
     pub duration_ms: u128,
     pub is_explain: bool,
     pub selected_row: usize,
+    pub scroll_offset: usize,
     pub error: Option<String>,
+}
+
+impl QueryResultState {
+    /// Update scroll offset to keep selected row visible.
+    pub fn ensure_visible(&mut self, visible_rows: usize) {
+        if visible_rows == 0 {
+            return;
+        }
+        // Scroll up if selected is above viewport
+        if self.selected_row < self.scroll_offset {
+            self.scroll_offset = self.selected_row;
+        }
+        // Scroll down if selected is below viewport
+        if self.selected_row >= self.scroll_offset + visible_rows {
+            self.scroll_offset = self.selected_row.saturating_sub(visible_rows - 1);
+        }
+    }
 }
 
 /// Application state.
@@ -310,6 +347,7 @@ impl App {
                             duration_ms: qr.duration_ms,
                             is_explain: qr.is_explain,
                             selected_row: 0,
+                            scroll_offset: 0,
                             error: None,
                         });
                         self.show_query_results = true;
@@ -322,6 +360,7 @@ impl App {
                             duration_ms: 0,
                             is_explain: false,
                             selected_row: 0,
+                            scroll_offset: 0,
                             error: Some(error),
                         });
                         self.show_query_results = true;
@@ -424,6 +463,7 @@ impl App {
             total_count: 0,
             page: 0,
             selected_row: 0,
+            scroll_offset: 0,
             loading: true,
             error: None,
         };
@@ -592,8 +632,8 @@ impl App {
                 }
             }
             CurrentView::TableList => {
-        match key_event.code {
-            KeyCode::Esc | KeyCode::Char('q') => self.events.send(AppEvent::Quit),
+                match key_event.code {
+                    KeyCode::Esc | KeyCode::Char('q') => self.events.send(AppEvent::Quit),
                     KeyCode::Up | KeyCode::Char('k') => {
                         if self.show_query_results {
                             if let Some(ref mut qr) = self.query_result
@@ -603,7 +643,10 @@ impl App {
                                     qr.selected_row -= 1;
                                 } else {
                                     qr.selected_row = qr.rows.len() - 1;
+                                    // Jump to end - reset scroll to show selection
+                                    qr.scroll_offset = qr.rows.len().saturating_sub(DEFAULT_VISIBLE_ROWS);
                                 }
+                                qr.ensure_visible(DEFAULT_VISIBLE_ROWS);
                             }
                         } else if !self.tables.is_empty() {
                             if self.selected_table_index > 0 {
@@ -622,7 +665,9 @@ impl App {
                                     qr.selected_row += 1;
                                 } else {
                                     qr.selected_row = 0;
+                                    qr.scroll_offset = 0; // Jump to beginning
                                 }
+                                qr.ensure_visible(DEFAULT_VISIBLE_ROWS);
                             }
                         } else if !self.tables.is_empty() {
                             if self.selected_table_index < self.tables.len() - 1 {
@@ -657,14 +702,18 @@ impl App {
                                     qr.selected_row -= 1;
                                 } else {
                                     qr.selected_row = qr.rows.len() - 1;
+                                    qr.scroll_offset = qr.rows.len().saturating_sub(DEFAULT_VISIBLE_ROWS);
                                 }
+                                qr.ensure_visible(DEFAULT_VISIBLE_ROWS);
                             }
                         } else if !state.rows.is_empty() {
                             if state.selected_row > 0 {
                                 state.selected_row -= 1;
                             } else {
                                 state.selected_row = state.rows.len() - 1;
+                                state.scroll_offset = state.rows.len().saturating_sub(DEFAULT_VISIBLE_ROWS);
                             }
+                            state.ensure_visible(DEFAULT_VISIBLE_ROWS);
                         }
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
@@ -676,14 +725,18 @@ impl App {
                                     qr.selected_row += 1;
                                 } else {
                                     qr.selected_row = 0;
+                                    qr.scroll_offset = 0;
                                 }
+                                qr.ensure_visible(DEFAULT_VISIBLE_ROWS);
                             }
                         } else if !state.rows.is_empty() {
                             if state.selected_row < state.rows.len() - 1 {
                                 state.selected_row += 1;
                             } else {
                                 state.selected_row = 0;
+                                state.scroll_offset = 0;
                             }
+                            state.ensure_visible(DEFAULT_VISIBLE_ROWS);
                         }
                     }
                     KeyCode::Left | KeyCode::Char('h') => {
@@ -691,6 +744,7 @@ impl App {
                             state.page -= 1;
                             state.loading = true;
                             state.selected_row = 0;
+                            state.scroll_offset = 0;
                             fetch_page = Some((state.table_name.clone(), state.page));
                         }
                     }
@@ -701,11 +755,12 @@ impl App {
                                 state.page += 1;
                                 state.loading = true;
                                 state.selected_row = 0;
+                                state.scroll_offset = 0;
                                 fetch_page = Some((state.table_name.clone(), state.page));
                             }
                         }
                     }
-            _ => {}
+                    _ => {}
                 }
             }
         }

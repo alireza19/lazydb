@@ -297,7 +297,7 @@ fn render_table_view(state: &TableViewState, app: &App, area: Rect, buf: &mut Bu
     } else if state.rows.is_empty() {
         render_centered_message(table_area, buf, "", "<empty table>", Color::DarkGray);
     } else {
-        render_data_table(&state.columns, &state.rows, state.selected_row, table_area, buf);
+        render_data_table(&state.columns, &state.rows, state.selected_row, state.scroll_offset, table_area, buf);
     }
 
     render_table_footer(state, footer_area, buf);
@@ -352,7 +352,7 @@ fn render_query_results(qr: &QueryResultState, app: &App, area: Rect, buf: &mut 
         // Render EXPLAIN as text
         render_explain_results(qr, table_area, buf);
     } else {
-        render_data_table(&qr.columns, &qr.rows, qr.selected_row, table_area, buf);
+        render_data_table(&qr.columns, &qr.rows, qr.selected_row, qr.scroll_offset, table_area, buf);
     }
 
     // Footer
@@ -413,13 +413,21 @@ fn render_centered_message(area: Rect, buf: &mut Buffer, prefix: &str, msg: &str
         .render(centered[1], buf);
 }
 
-/// Render the actual data table.
-fn render_data_table(columns: &[String], rows: &[Vec<String>], selected_row: usize, area: Rect, buf: &mut Buffer) {
+/// Render the actual data table with scrolling support.
+fn render_data_table(
+    columns: &[String],
+    rows: &[Vec<String>],
+    selected_row: usize,
+    scroll_offset: usize,
+    area: Rect,
+    buf: &mut Buffer,
+) {
     let col_count = columns.len();
     if col_count == 0 {
         return;
     }
 
+    // Calculate column widths based on content
     let mut col_widths: Vec<usize> = columns.iter().map(|c| c.len()).collect();
     for row in rows {
         for (i, cell) in row.iter().enumerate() {
@@ -434,6 +442,7 @@ fn render_data_table(columns: &[String], rows: &[Vec<String>], selected_row: usi
         .map(|&w| Constraint::Length((w + 2) as u16))
         .collect();
 
+    // Header
     let header_cells: Vec<Cell> = columns
         .iter()
         .map(|col| {
@@ -445,11 +454,21 @@ fn render_data_table(columns: &[String], rows: &[Vec<String>], selected_row: usi
         .style(Style::default())
         .height(1);
 
-    let data_rows: Vec<Row> = rows
+    // Calculate visible area (height minus header)
+    let visible_rows = area.height.saturating_sub(1) as usize;
+
+    // Get the visible slice of rows
+    let end_idx = (scroll_offset + visible_rows).min(rows.len());
+    let visible_slice = &rows[scroll_offset..end_idx];
+
+    // Build visible rows with correct selection highlighting
+    let data_rows: Vec<Row> = visible_slice
         .iter()
         .enumerate()
-        .map(|(i, row)| {
-            let is_selected = i == selected_row;
+        .map(|(visible_idx, row)| {
+            let actual_idx = scroll_offset + visible_idx;
+            let is_selected = actual_idx == selected_row;
+
             let cells: Vec<Cell> = row
                 .iter()
                 .map(|cell| {
@@ -484,6 +503,11 @@ fn render_data_table(columns: &[String], rows: &[Vec<String>], selected_row: usi
         .row_highlight_style(Style::default().bg(Color::Rgb(40, 40, 60)));
 
     Widget::render(table, area, buf);
+}
+
+/// Calculate visible row count for a given area (minus header).
+pub fn visible_row_count(area: Rect) -> usize {
+    area.height.saturating_sub(1) as usize
 }
 
 /// Render the table view footer.
