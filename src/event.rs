@@ -19,6 +19,16 @@ pub enum Event {
     App(AppEvent),
 }
 
+/// Result of fetching table data.
+#[derive(Debug, Clone)]
+pub struct TableDataResult {
+    pub table_name: String,
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<String>>,
+    pub total_count: i64,
+    pub page: usize,
+}
+
 /// Application events.
 #[derive(Debug)]
 pub enum AppEvent {
@@ -28,6 +38,8 @@ pub enum AppEvent {
     ConnectionResult(Result<(PgPool, String), String>),
     /// Tables loaded from database.
     TablesLoaded(Vec<String>),
+    /// Table data loaded.
+    TableDataLoaded(Result<TableDataResult, String>),
 }
 
 /// Terminal event handler.

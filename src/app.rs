@@ -1,14 +1,17 @@
-use crate::event::{AppEvent, Event, EventHandler};
+use crate::event::{AppEvent, Event, EventHandler, TableDataResult};
 use clap::Parser;
 use ratatui::{
     crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
     DefaultTerminal,
 };
-use sqlx::PgPool;
+use sqlx::{Column, PgPool, Row};
 use std::env;
 use std::time::Duration;
 use tokio::task::JoinHandle;
 use tracing::{debug, info};
+
+/// Page size for table data pagination.
+pub const PAGE_SIZE: usize = 50;
 
 /// A lazydocker-inspired database TUI
 #[derive(Parser, Debug)]
@@ -43,13 +46,47 @@ pub enum ConnectionState {
     Failed { error: String },
 }
 
+/// State for viewing a table's data.
+#[derive(Debug, Clone)]
+pub struct TableViewState {
+    /// Name of the table being viewed.
+    pub table_name: String,
+    /// Column names.
+    pub columns: Vec<String>,
+    /// Current page of rows.
+    pub rows: Vec<Vec<String>>,
+    /// Total row count in the table.
+    pub total_count: i64,
+    /// Current page number (0-indexed).
+    pub page: usize,
+    /// Currently selected row index within the page.
+    pub selected_row: usize,
+    /// Loading state.
+    pub loading: bool,
+    /// Error message if fetch failed.
+    pub error: Option<String>,
+}
+
+impl TableViewState {
+    /// Calculate total number of pages.
+    pub fn total_pages(&self) -> usize {
+        if self.total_count == 0 {
+            1
+        } else {
+            (self.total_count as usize).div_ceil(PAGE_SIZE)
+        }
+    }
+}
+
 /// Current view state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum CurrentView {
     /// Showing connection status (connecting or failed).
     ConnectionStatus,
     /// Showing table list after successful connection.
     TableList,
+    /// Viewing a specific table's data.
+    TableView(TableViewState),
 }
 
 /// Application state.
@@ -62,7 +99,7 @@ pub struct App {
     pub current_view: CurrentView,
     /// List of tables in public schema.
     pub tables: Vec<String>,
-    /// Currently selected table index.
+    /// Currently selected table index in sidebar.
     pub selected_table_index: usize,
     /// Event handler.
     pub events: EventHandler,
@@ -163,14 +200,12 @@ impl App {
                         if let Some(new_index) = self.tables.iter().position(|t| t == &prev_name) {
                             self.selected_table_index = new_index;
                         } else {
-                            // Table no longer exists, reset to 0
                             self.selected_table_index = 0;
                         }
                     } else {
                         self.selected_table_index = 0;
                     }
 
-                    // Ensure index is valid for empty list
                     if self.tables.is_empty() {
                         self.selected_table_index = 0;
                     }
@@ -181,6 +216,33 @@ impl App {
                 // Start the refresh task if not already running
                 if self.refresh_handle.is_none() {
                     self.start_refresh_task();
+                }
+            }
+            AppEvent::TableDataLoaded(result) => {
+                match result {
+                    Ok(data) => {
+                        // Only update if we're still viewing the same table
+                        if let CurrentView::TableView(ref mut state) = self.current_view
+                            && state.table_name == data.table_name
+                            && state.page == data.page
+                        {
+                            state.columns = data.columns;
+                            state.rows = data.rows;
+                            state.total_count = data.total_count;
+                            state.loading = false;
+                            state.error = None;
+                            // Reset selection if out of bounds
+                            if state.selected_row >= state.rows.len() && !state.rows.is_empty() {
+                                state.selected_row = state.rows.len() - 1;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        if let CurrentView::TableView(ref mut state) = self.current_view {
+                            state.loading = false;
+                            state.error = Some(error);
+                        }
+                    }
                 }
             }
         }
@@ -194,19 +256,16 @@ impl App {
 
             let handle = tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(3));
-                // Skip the first tick (immediate)
                 interval.tick().await;
 
                 loop {
                     interval.tick().await;
 
-                    // Check if the sender is closed (app is shutting down)
                     if sender.is_closed() {
                         debug!("refresh task stopping – channel closed");
                         break;
                     }
 
-                    // Check if pool is still usable
                     if pool.is_closed() {
                         debug!("refresh task stopping – pool closed");
                         break;
@@ -214,7 +273,6 @@ impl App {
 
                     let tables = fetch_tables(&pool).await;
                     if sender.send(Event::App(AppEvent::TablesLoaded(tables))).is_err() {
-                        // Channel closed, stop the task
                         break;
                     }
                 }
@@ -224,39 +282,142 @@ impl App {
         }
     }
 
+    /// Fetch table data for a given table and page.
+    fn fetch_table_data(&self, table_name: &str, page: usize) {
+        if let ConnectionState::Connected { pool, .. } = &self.connection {
+            let pool = pool.clone();
+            let sender = self.events.sender();
+            let table_name = table_name.to_string();
+
+            tokio::spawn(async move {
+                let result = fetch_table_page(&pool, &table_name, page).await;
+                let _ = sender.send(Event::App(AppEvent::TableDataLoaded(result)));
+            });
+        }
+    }
+
+    /// Open a table for viewing.
+    fn open_table(&mut self, table_name: &str) {
+        info!("Opening table: {}", table_name);
+
+        let state = TableViewState {
+            table_name: table_name.to_string(),
+            columns: Vec::new(),
+            rows: Vec::new(),
+            total_count: 0,
+            page: 0,
+            selected_row: 0,
+            loading: true,
+            error: None,
+        };
+
+        self.current_view = CurrentView::TableView(state);
+        self.fetch_table_data(table_name, 0);
+    }
+
     /// Handles the key events and updates the state of [`App`].
     pub fn handle_key_events(&mut self, key_event: KeyEvent) -> color_eyre::Result<()> {
-        match key_event.code {
-            KeyCode::Esc | KeyCode::Char('q') => self.events.send(AppEvent::Quit),
-            KeyCode::Char('c' | 'C') if key_event.modifiers == KeyModifiers::CONTROL => {
-                self.events.send(AppEvent::Quit)
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                if self.current_view == CurrentView::TableList && !self.tables.is_empty() {
-                    if self.selected_table_index > 0 {
-                        self.selected_table_index -= 1;
-                    } else {
-                        self.selected_table_index = self.tables.len() - 1;
-                    }
-                }
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if self.current_view == CurrentView::TableList && !self.tables.is_empty() {
-                    if self.selected_table_index < self.tables.len() - 1 {
-                        self.selected_table_index += 1;
-                    } else {
-                        self.selected_table_index = 0;
-                    }
-                }
-            }
-            KeyCode::Enter => {
-                if self.current_view == CurrentView::TableList && !self.tables.is_empty() {
-                    let table_name = &self.tables[self.selected_table_index];
-                    info!("Selected: {}", table_name);
-                }
-            }
-            _ => {}
+        // Global quit shortcuts
+        if matches!(key_event.code, KeyCode::Char('c') | KeyCode::Char('C'))
+            && key_event.modifiers == KeyModifiers::CONTROL
+        {
+            self.events.send(AppEvent::Quit);
+            return Ok(());
         }
+
+        // Track if we need to fetch new page data
+        let mut fetch_page: Option<(String, usize)> = None;
+
+        match &mut self.current_view {
+            CurrentView::ConnectionStatus => {
+                if matches!(key_event.code, KeyCode::Esc | KeyCode::Char('q')) {
+                    self.events.send(AppEvent::Quit);
+                }
+            }
+            CurrentView::TableList => {
+                match key_event.code {
+                    KeyCode::Esc | KeyCode::Char('q') => self.events.send(AppEvent::Quit),
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        if !self.tables.is_empty() {
+                            if self.selected_table_index > 0 {
+                                self.selected_table_index -= 1;
+                            } else {
+                                self.selected_table_index = self.tables.len() - 1;
+                            }
+                        }
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        if !self.tables.is_empty() {
+                            if self.selected_table_index < self.tables.len() - 1 {
+                                self.selected_table_index += 1;
+                            } else {
+                                self.selected_table_index = 0;
+                            }
+                        }
+                    }
+                    KeyCode::Enter => {
+                        if !self.tables.is_empty() {
+                            let table_name = self.tables[self.selected_table_index].clone();
+                            self.open_table(&table_name);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            CurrentView::TableView(state) => {
+                match key_event.code {
+                    KeyCode::Esc | KeyCode::Char('b') => {
+                        // Go back to table list
+                        self.current_view = CurrentView::TableList;
+                    }
+                    KeyCode::Char('q') => self.events.send(AppEvent::Quit),
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        if !state.rows.is_empty() {
+                            if state.selected_row > 0 {
+                                state.selected_row -= 1;
+                            } else {
+                                state.selected_row = state.rows.len() - 1;
+                            }
+                        }
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        if !state.rows.is_empty() {
+                            if state.selected_row < state.rows.len() - 1 {
+                                state.selected_row += 1;
+                            } else {
+                                state.selected_row = 0;
+                            }
+                        }
+                    }
+                    KeyCode::Left | KeyCode::Char('h') => {
+                        // Previous page
+                        if state.page > 0 && !state.loading {
+                            state.page -= 1;
+                            state.loading = true;
+                            state.selected_row = 0;
+                            fetch_page = Some((state.table_name.clone(), state.page));
+                        }
+                    }
+                    KeyCode::Right | KeyCode::Char('l') => {
+                        // Next page
+                        let total_pages = state.total_pages();
+                        if state.page < total_pages.saturating_sub(1) && !state.loading {
+                            state.page += 1;
+                            state.loading = true;
+                            state.selected_row = 0;
+                            fetch_page = Some((state.table_name.clone(), state.page));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Fetch page data outside the match to avoid borrow issues
+        if let Some((table_name, page)) = fetch_page {
+            self.fetch_table_data(&table_name, page);
+        }
+
         Ok(())
     }
 
@@ -271,7 +432,6 @@ impl App {
 
 impl Drop for App {
     fn drop(&mut self) {
-        // Abort the refresh task if it's running
         if let Some(handle) = self.refresh_handle.take() {
             handle.abort();
         }
@@ -307,4 +467,101 @@ async fn fetch_tables(pool: &PgPool) -> Vec<String> {
             Vec::new()
         }
     }
+}
+
+/// Fetch a page of data from a table.
+async fn fetch_table_page(
+    pool: &PgPool,
+    table_name: &str,
+    page: usize,
+) -> Result<TableDataResult, String> {
+    let offset = page * PAGE_SIZE;
+
+    // Fetch total count
+    let count_query = format!(r#"SELECT COUNT(*) FROM "{}""#, table_name);
+    let total_count: (i64,) = sqlx::query_as(&count_query)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| format!("Failed to get row count: {e}"))?;
+
+    // Fetch rows with columns
+    let data_query = format!(
+        r#"SELECT * FROM "{}" LIMIT {} OFFSET {}"#,
+        table_name, PAGE_SIZE, offset
+    );
+
+    let rows = sqlx::query(&data_query)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| format!("Failed to fetch data: {e}"))?;
+
+    // Extract column names from the first row or query metadata
+    let columns: Vec<String> = if rows.is_empty() {
+        // If no rows, we need to get columns from table info
+        let columns_query = format!(
+            r#"SELECT column_name FROM information_schema.columns 
+               WHERE table_schema = 'public' AND table_name = '{}' 
+               ORDER BY ordinal_position"#,
+            table_name
+        );
+        let col_rows: Vec<(String,)> = sqlx::query_as(&columns_query)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| format!("Failed to get column info: {e}"))?;
+        col_rows.into_iter().map(|(name,)| name).collect()
+    } else {
+        rows[0]
+            .columns()
+            .iter()
+            .map(|c| c.name().to_string())
+            .collect()
+    };
+
+    // Convert rows to Vec<Vec<String>>
+    let string_rows: Vec<Vec<String>> = rows
+        .iter()
+        .map(|row| {
+            columns
+                .iter()
+                .enumerate()
+                .map(|(i, _)| {
+                    // Try to get value as string, handle various types
+                    row.try_get::<String, _>(i)
+                        .or_else(|_| row.try_get::<i64, _>(i).map(|v| v.to_string()))
+                        .or_else(|_| row.try_get::<i32, _>(i).map(|v| v.to_string()))
+                        .or_else(|_| row.try_get::<f64, _>(i).map(|v| v.to_string()))
+                        .or_else(|_| row.try_get::<bool, _>(i).map(|v| v.to_string()))
+                        .or_else(|_| {
+                            row.try_get::<Option<String>, _>(i)
+                                .map(|v| v.unwrap_or_else(|| "NULL".to_string()))
+                        })
+                        .or_else(|_| {
+                            row.try_get::<Option<i64>, _>(i)
+                                .map(|v| v.map_or("NULL".to_string(), |n| n.to_string()))
+                        })
+                        .or_else(|_| {
+                            row.try_get::<Option<i32>, _>(i)
+                                .map(|v| v.map_or("NULL".to_string(), |n| n.to_string()))
+                        })
+                        .or_else(|_| {
+                            row.try_get::<Option<f64>, _>(i)
+                                .map(|v| v.map_or("NULL".to_string(), |n| n.to_string()))
+                        })
+                        .or_else(|_| {
+                            row.try_get::<Option<bool>, _>(i)
+                                .map(|v| v.map_or("NULL".to_string(), |b| b.to_string()))
+                        })
+                        .unwrap_or_else(|_| "<?>".to_string())
+                })
+                .collect()
+        })
+        .collect();
+
+    Ok(TableDataResult {
+        table_name: table_name.to_string(),
+        columns,
+        rows: string_rows,
+        total_count: total_count.0,
+        page,
+    })
 }
