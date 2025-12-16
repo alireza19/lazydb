@@ -271,6 +271,8 @@ pub struct App {
     pub tables: Vec<String>,
     /// Currently selected table index in sidebar.
     pub selected_table_index: usize,
+    /// Sidebar scroll offset for visible window.
+    pub sidebar_scroll_offset: usize,
     /// Event handler.
     pub events: EventHandler,
     /// Handle for the background refresh task.
@@ -281,6 +283,8 @@ pub struct App {
     pub focused_pane: FocusedPane,
     /// SQL editor text area.
     pub sql_editor: TextArea<'static>,
+    /// SQL editor scroll offset for rendering.
+    pub editor_scroll_offset: usize,
     /// Query history.
     pub query_history: VecDeque<String>,
     /// Current position in history (None = not browsing history).
@@ -297,6 +301,8 @@ pub struct App {
     pub show_query_results: bool,
     /// Stats panel state.
     pub stats: StatsState,
+    /// Stats panel scroll offset.
+    pub stats_scroll_offset: usize,
 }
 
 impl std::fmt::Debug for App {
@@ -353,11 +359,13 @@ impl App {
             current_view: CurrentView::ConnectionStatus,
             tables: Vec::new(),
             selected_table_index: 0,
+            sidebar_scroll_offset: 0,
             events,
             refresh_handle: None,
             stats_handle: None,
             focused_pane: FocusedPane::Sidebar,
             sql_editor,
+            editor_scroll_offset: 0,
             query_history: VecDeque::new(),
             history_index: None,
             saved_editor_content: None,
@@ -381,6 +389,7 @@ impl App {
                 queries_this_second: 0,
                 rows_this_second: 0,
             },
+            stats_scroll_offset: 0,
         }
     }
 
@@ -399,6 +408,9 @@ impl App {
                     crossterm::event::Event::Paste(data) => {
                         self.handle_paste(&data);
                     }
+                    crossterm::event::Event::Mouse(mouse_event) => {
+                        self.handle_mouse_event(mouse_event);
+                    }
                     _ => {}
                 },
                 Event::App(app_event) => self.handle_app_event(app_event),
@@ -412,6 +424,128 @@ impl App {
         // Only paste into SQL editor when it's focused
         if self.focused_pane == FocusedPane::Editor {
             self.sql_editor.insert_str(data);
+        }
+    }
+
+    /// Handle mouse events (scroll wheel).
+    fn handle_mouse_event(&mut self, event: crossterm::event::MouseEvent) {
+        use crossterm::event::{MouseEventKind, MouseButton};
+
+        match event.kind {
+            MouseEventKind::ScrollUp => {
+                self.scroll_focused_pane(-3);
+            }
+            MouseEventKind::ScrollDown => {
+                self.scroll_focused_pane(3);
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                // Could add click-to-focus here in the future
+            }
+            _ => {}
+        }
+    }
+
+    /// Scroll the currently focused pane by delta lines.
+    fn scroll_focused_pane(&mut self, delta: i32) {
+        match self.focused_pane {
+            FocusedPane::Sidebar => {
+                self.scroll_sidebar(delta);
+            }
+            FocusedPane::Results => {
+                self.scroll_results(delta);
+            }
+            FocusedPane::Editor => {
+                self.scroll_editor(delta);
+            }
+            FocusedPane::Stats => {
+                self.scroll_stats(delta);
+            }
+        }
+    }
+
+    /// Scroll sidebar by delta.
+    fn scroll_sidebar(&mut self, delta: i32) {
+        if self.tables.is_empty() {
+            return;
+        }
+        let new_index = if delta < 0 {
+            self.selected_table_index.saturating_sub((-delta) as usize)
+        } else {
+            (self.selected_table_index + delta as usize).min(self.tables.len().saturating_sub(1))
+        };
+        self.selected_table_index = new_index;
+    }
+
+    /// Scroll results pane by delta.
+    fn scroll_results(&mut self, delta: i32) {
+        if self.show_query_results {
+            if let Some(ref mut qr) = self.query_result {
+                if qr.rows.is_empty() {
+                    return;
+                }
+                let new_row = if delta < 0 {
+                    qr.selected_row.saturating_sub((-delta) as usize)
+                } else {
+                    (qr.selected_row + delta as usize).min(qr.rows.len().saturating_sub(1))
+                };
+                qr.selected_row = new_row;
+                qr.ensure_visible(DEFAULT_VISIBLE_ROWS);
+            }
+        } else if let CurrentView::TableView(ref mut state) = self.current_view {
+            if state.rows.is_empty() {
+                return;
+            }
+            let new_row = if delta < 0 {
+                state.selected_row.saturating_sub((-delta) as usize)
+            } else {
+                (state.selected_row + delta as usize).min(state.rows.len().saturating_sub(1))
+            };
+            state.selected_row = new_row;
+            state.ensure_visible(DEFAULT_VISIBLE_ROWS);
+        }
+    }
+
+    /// Scroll SQL editor by delta.
+    fn scroll_editor(&mut self, delta: i32) {
+        let line_count = self.sql_editor.lines().len();
+        if line_count == 0 {
+            return;
+        }
+
+        if delta < 0 {
+            // Scroll up
+            for _ in 0..(-delta) {
+                self.sql_editor.move_cursor(tui_textarea::CursorMove::Up);
+            }
+        } else {
+            // Scroll down
+            for _ in 0..delta {
+                self.sql_editor.move_cursor(tui_textarea::CursorMove::Down);
+            }
+        }
+        self.update_editor_scroll();
+    }
+
+    /// Update editor scroll offset based on cursor position.
+    fn update_editor_scroll(&mut self) {
+        let (cursor_row, _) = self.sql_editor.cursor();
+        let visible_rows = DEFAULT_VISIBLE_ROWS.saturating_sub(2); // Account for borders/footer
+
+        if cursor_row < self.editor_scroll_offset {
+            self.editor_scroll_offset = cursor_row;
+        }
+        if cursor_row >= self.editor_scroll_offset + visible_rows {
+            self.editor_scroll_offset = cursor_row.saturating_sub(visible_rows - 1);
+        }
+    }
+
+    /// Scroll stats panel by delta.
+    fn scroll_stats(&mut self, delta: i32) {
+        // Stats panel is usually short, but support scrolling if needed
+        if delta < 0 {
+            self.stats_scroll_offset = self.stats_scroll_offset.saturating_sub((-delta) as usize);
+        } else {
+            self.stats_scroll_offset += delta as usize;
         }
     }
 
@@ -780,6 +914,36 @@ impl App {
             return Ok(());
         }
 
+        // PageUp/PageDown for fast scrolling
+        if key_event.code == KeyCode::PageUp {
+            for _ in 0..DEFAULT_VISIBLE_ROWS {
+                self.sql_editor.move_cursor(tui_textarea::CursorMove::Up);
+            }
+            self.update_editor_scroll();
+            return Ok(());
+        }
+
+        if key_event.code == KeyCode::PageDown {
+            for _ in 0..DEFAULT_VISIBLE_ROWS {
+                self.sql_editor.move_cursor(tui_textarea::CursorMove::Down);
+            }
+            self.update_editor_scroll();
+            return Ok(());
+        }
+
+        // Ctrl+Home / Ctrl+End for jumping to start/end
+        if key_event.code == KeyCode::Home && key_event.modifiers.contains(KeyModifiers::CONTROL) {
+            self.sql_editor.move_cursor(tui_textarea::CursorMove::Top);
+            self.editor_scroll_offset = 0;
+            return Ok(());
+        }
+
+        if key_event.code == KeyCode::End && key_event.modifiers.contains(KeyModifiers::CONTROL) {
+            self.sql_editor.move_cursor(tui_textarea::CursorMove::Bottom);
+            self.update_editor_scroll();
+            return Ok(());
+        }
+
         // History navigation with Up/Down when editor is empty or at boundaries
         if key_event.code == KeyCode::Up && key_event.modifiers.is_empty() {
             let (row, _) = self.sql_editor.cursor();
@@ -800,6 +964,8 @@ impl App {
 
         // Pass other keys to the text area
         self.sql_editor.input(key_event);
+        // Update scroll after any input
+        self.update_editor_scroll();
         Ok(())
     }
 
@@ -874,6 +1040,19 @@ impl App {
         }
     }
 
+    /// Ensure sidebar selection is visible within scroll window.
+    fn ensure_sidebar_visible(&mut self, visible_rows: usize) {
+        if visible_rows == 0 || self.tables.is_empty() {
+            return;
+        }
+        if self.selected_table_index < self.sidebar_scroll_offset {
+            self.sidebar_scroll_offset = self.selected_table_index;
+        }
+        if self.selected_table_index >= self.sidebar_scroll_offset + visible_rows {
+            self.sidebar_scroll_offset = self.selected_table_index.saturating_sub(visible_rows - 1);
+        }
+    }
+
     /// Handle keys when navigation pane is focused.
     /// Handle keys when sidebar (table list) is focused.
     fn handle_sidebar_keys(&mut self, key_event: KeyEvent) -> color_eyre::Result<()> {
@@ -887,7 +1066,10 @@ impl App {
                         self.selected_table_index -= 1;
                     } else {
                         self.selected_table_index = self.tables.len() - 1;
+                        // Jump scroll to bottom when wrapping
+                        self.sidebar_scroll_offset = self.tables.len().saturating_sub(DEFAULT_VISIBLE_ROWS);
                     }
+                    self.ensure_sidebar_visible(DEFAULT_VISIBLE_ROWS);
                 }
             }
             KeyCode::Down | KeyCode::Char('j') => {
@@ -896,7 +1078,34 @@ impl App {
                         self.selected_table_index += 1;
                     } else {
                         self.selected_table_index = 0;
+                        self.sidebar_scroll_offset = 0;
                     }
+                    self.ensure_sidebar_visible(DEFAULT_VISIBLE_ROWS);
+                }
+            }
+            KeyCode::PageUp => {
+                if !self.tables.is_empty() {
+                    self.selected_table_index = self.selected_table_index.saturating_sub(DEFAULT_VISIBLE_ROWS);
+                    self.ensure_sidebar_visible(DEFAULT_VISIBLE_ROWS);
+                }
+            }
+            KeyCode::PageDown => {
+                if !self.tables.is_empty() {
+                    self.selected_table_index = (self.selected_table_index + DEFAULT_VISIBLE_ROWS)
+                        .min(self.tables.len().saturating_sub(1));
+                    self.ensure_sidebar_visible(DEFAULT_VISIBLE_ROWS);
+                }
+            }
+            KeyCode::Home => {
+                if !self.tables.is_empty() {
+                    self.selected_table_index = 0;
+                    self.sidebar_scroll_offset = 0;
+                }
+            }
+            KeyCode::End => {
+                if !self.tables.is_empty() {
+                    self.selected_table_index = self.tables.len() - 1;
+                    self.sidebar_scroll_offset = self.tables.len().saturating_sub(DEFAULT_VISIBLE_ROWS);
                 }
             }
             KeyCode::Enter => {
@@ -962,6 +1171,23 @@ impl App {
                         }
                         qr.ensure_visible(DEFAULT_VISIBLE_ROWS);
                     }
+                    KeyCode::PageUp => {
+                        qr.selected_row = qr.selected_row.saturating_sub(DEFAULT_VISIBLE_ROWS);
+                        qr.ensure_visible(DEFAULT_VISIBLE_ROWS);
+                    }
+                    KeyCode::PageDown => {
+                        qr.selected_row = (qr.selected_row + DEFAULT_VISIBLE_ROWS)
+                            .min(qr.rows.len().saturating_sub(1));
+                        qr.ensure_visible(DEFAULT_VISIBLE_ROWS);
+                    }
+                    KeyCode::Home => {
+                        qr.selected_row = 0;
+                        qr.scroll_offset = 0;
+                    }
+                    KeyCode::End => {
+                        qr.selected_row = qr.rows.len().saturating_sub(1);
+                        qr.scroll_offset = qr.rows.len().saturating_sub(DEFAULT_VISIBLE_ROWS);
+                    }
                     _ => {}
                 }
             }
@@ -988,6 +1214,31 @@ impl App {
                             state.scroll_offset = 0;
                         }
                         state.ensure_visible(DEFAULT_VISIBLE_ROWS);
+                    }
+                }
+                KeyCode::PageUp => {
+                    if !state.rows.is_empty() {
+                        state.selected_row = state.selected_row.saturating_sub(DEFAULT_VISIBLE_ROWS);
+                        state.ensure_visible(DEFAULT_VISIBLE_ROWS);
+                    }
+                }
+                KeyCode::PageDown => {
+                    if !state.rows.is_empty() {
+                        state.selected_row = (state.selected_row + DEFAULT_VISIBLE_ROWS)
+                            .min(state.rows.len().saturating_sub(1));
+                        state.ensure_visible(DEFAULT_VISIBLE_ROWS);
+                    }
+                }
+                KeyCode::Home => {
+                    if !state.rows.is_empty() {
+                        state.selected_row = 0;
+                        state.scroll_offset = 0;
+                    }
+                }
+                KeyCode::End => {
+                    if !state.rows.is_empty() {
+                        state.selected_row = state.rows.len().saturating_sub(1);
+                        state.scroll_offset = state.rows.len().saturating_sub(DEFAULT_VISIBLE_ROWS);
                     }
                 }
                 KeyCode::Left | KeyCode::Char('h') => {

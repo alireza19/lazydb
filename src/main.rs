@@ -1,6 +1,9 @@
 use crate::app::{App, Cli};
 use clap::Parser;
-use crossterm::{event::{DisableBracketedPaste, EnableBracketedPaste}, execute};
+use crossterm::{
+    event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture},
+    execute,
+};
 use std::io::stdout;
 
 pub mod app;
@@ -18,12 +21,13 @@ async fn main() -> color_eyre::Result<()> {
     let terminal = ratatui::init();
 
     // Enable bracketed paste mode for instant paste handling
-    execute!(stdout(), EnableBracketedPaste)?;
+    // Enable mouse capture for scroll wheel support
+    execute!(stdout(), EnableBracketedPaste, EnableMouseCapture)?;
 
     let result = App::new(database_url).run(terminal).await;
 
-    // Disable bracketed paste mode before restoring terminal
-    let _ = execute!(stdout(), DisableBracketedPaste);
+    // Disable mouse capture and bracketed paste mode before restoring terminal
+    let _ = execute!(stdout(), DisableMouseCapture, DisableBracketedPaste);
     ratatui::restore();
 
     result

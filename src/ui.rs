@@ -216,10 +216,18 @@ fn render_sidebar(app: &App, area: Rect, buf: &mut Buffer) {
 
         empty_text.render(centered_layout[1], buf);
     } else {
+        let visible_rows = list_area.height as usize;
+        let scroll_offset = app.sidebar_scroll_offset.min(
+            app.tables.len().saturating_sub(visible_rows)
+        );
+        let end_idx = (scroll_offset + visible_rows).min(app.tables.len());
+
         let items: Vec<ListItem> = app
             .tables
             .iter()
             .enumerate()
+            .skip(scroll_offset)
+            .take(end_idx - scroll_offset)
             .map(|(i, table)| {
                 let is_selected = i == app.selected_table_index;
                 let is_viewing = viewing_table == Some(table.as_str());
@@ -231,7 +239,7 @@ fn render_sidebar(app: &App, area: Rect, buf: &mut Buffer) {
                         .add_modifier(Modifier::BOLD)
                 } else if is_selected {
                     Style::default()
-            .fg(Color::Cyan)
+                        .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::White)
@@ -244,16 +252,36 @@ fn render_sidebar(app: &App, area: Rect, buf: &mut Buffer) {
             })
             .collect();
 
-        let list = List::new(items);
+        let list = List::new(items)
+            .highlight_style(Style::default().bg(Color::Rgb(40, 40, 60)));
+
+        // Adjust selected index for the visible slice
         let mut state = ListState::default();
-        state.select(Some(app.selected_table_index));
+        if app.selected_table_index >= scroll_offset && app.selected_table_index < end_idx {
+            state.select(Some(app.selected_table_index - scroll_offset));
+        }
 
         ratatui::widgets::StatefulWidget::render(list, list_area, buf, &mut state);
     }
 
-    // Footer
+    // Footer with scroll indicator
+    let scroll_info = if !app.tables.is_empty() {
+        let visible_rows = list_area.height as usize;
+        if app.tables.len() > visible_rows {
+            format!(
+                "{}/{} tables",
+                app.selected_table_index + 1,
+                app.tables.len()
+            )
+        } else {
+            format!("{} tables", app.tables.len())
+        }
+    } else {
+        "0 tables".to_string()
+    };
+
     let footer = Line::from(vec![Span::styled(
-        format!("{} tables", app.tables.len()),
+        scroll_info,
         Style::default().fg(Color::DarkGray),
     )]);
 
@@ -852,13 +880,20 @@ fn render_sql_editor(app: &App, area: Rect, buf: &mut Buffer) {
     let editor_area = layout[0];
     let footer_area = layout[1];
 
-    // Render the editor content with syntax highlighting
+    // Render the editor content with syntax highlighting and scrolling
     let lines = app.sql_editor.lines();
     let cursor = app.sql_editor.cursor();
+    let visible_rows = editor_area.height as usize;
+
+    // Calculate scroll offset to keep cursor visible
+    let scroll_offset = app.editor_scroll_offset.min(lines.len().saturating_sub(1));
+    let end_idx = (scroll_offset + visible_rows).min(lines.len());
 
     let highlighted_lines: Vec<Line> = lines
         .iter()
         .enumerate()
+        .skip(scroll_offset)
+        .take(end_idx - scroll_offset)
         .map(|(line_idx, line)| {
             if line.is_empty() && !is_focused {
                 // Show placeholder for empty editor
@@ -878,17 +913,45 @@ fn render_sql_editor(app: &App, area: Rect, buf: &mut Buffer) {
 
     editor_widget.render(editor_area, buf);
 
-    // Draw cursor if focused
+    // Draw cursor if focused and visible
     if is_focused {
         let (cursor_row, cursor_col) = cursor;
-        let cursor_y = editor_area.y + cursor_row as u16;
-        let cursor_x = editor_area.x + cursor_col as u16;
+        // Adjust cursor position for scroll offset
+        if cursor_row >= scroll_offset && cursor_row < end_idx {
+            let visible_row = cursor_row - scroll_offset;
+            let cursor_y = editor_area.y + visible_row as u16;
+            let cursor_x = editor_area.x + cursor_col as u16;
 
-        if cursor_y < editor_area.y + editor_area.height
-            && cursor_x < editor_area.x + editor_area.width
-            && let Some(cell) = buf.cell_mut((cursor_x, cursor_y))
-        {
-            cell.set_style(Style::default().bg(Color::White).fg(Color::Black));
+            if cursor_y < editor_area.y + editor_area.height
+                && cursor_x < editor_area.x + editor_area.width
+                && let Some(cell) = buf.cell_mut((cursor_x, cursor_y))
+            {
+                cell.set_style(Style::default().bg(Color::White).fg(Color::Black));
+            }
+        }
+    }
+
+    // Show scroll indicator if content is scrollable
+    let total_lines = lines.len();
+    if total_lines > visible_rows && visible_rows > 0 {
+        // Calculate scrollbar position
+        let scrollbar_height = editor_area.height.saturating_sub(1).max(1);
+        let scroll_ratio = scroll_offset as f32 / (total_lines - visible_rows).max(1) as f32;
+        let thumb_pos = (scroll_ratio * (scrollbar_height - 1) as f32) as u16;
+
+        // Draw scroll track and thumb on right edge
+        let scroll_x = editor_area.x + editor_area.width - 1;
+        for y in 0..editor_area.height {
+            let abs_y = editor_area.y + y;
+            if let Some(cell) = buf.cell_mut((scroll_x, abs_y)) {
+                if y == thumb_pos {
+                    cell.set_char('█');
+                    cell.set_style(Style::default().fg(Color::Rgb(100, 100, 100)));
+                } else {
+                    cell.set_char('│');
+                    cell.set_style(Style::default().fg(Color::Rgb(50, 50, 50)));
+                }
+            }
         }
     }
 
