@@ -396,12 +396,23 @@ impl App {
                     {
                         self.handle_key_events(key_event)?
                     }
+                    crossterm::event::Event::Paste(data) => {
+                        self.handle_paste(&data);
+                    }
                     _ => {}
                 },
                 Event::App(app_event) => self.handle_app_event(app_event),
             }
         }
         Ok(())
+    }
+
+    /// Handle paste events (bracketed paste mode).
+    fn handle_paste(&mut self, data: &str) {
+        // Only paste into SQL editor when it's focused
+        if self.focused_pane == FocusedPane::Editor {
+            self.sql_editor.insert_str(data);
+        }
     }
 
     /// Handle application-specific events.
