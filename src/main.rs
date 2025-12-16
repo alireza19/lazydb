@@ -5,6 +5,8 @@ use crossterm::{
     execute,
 };
 use std::io::stdout;
+use tui_logger::{init_logger, set_default_level, TuiTracingSubscriberLayer};
+use tracing_subscriber::prelude::*;
 
 pub mod app;
 pub mod dotline;
@@ -14,6 +16,15 @@ pub mod ui;
 #[tokio::main]
 async fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
+
+    // Initialize tui-logger for the DB logs pane
+    init_logger(tui_logger::LevelFilter::Trace).expect("failed to init tui-logger");
+    set_default_level(tui_logger::LevelFilter::Trace);
+
+    // Set up tracing to route to tui-logger
+    tracing_subscriber::registry()
+        .with(TuiTracingSubscriberLayer)
+        .init();
 
     let cli = Cli::parse();
     let database_url = cli.get_database_url()?;

@@ -5,6 +5,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, BorderType, Cell, List, ListItem, ListState, Paragraph, Row, Table, Widget, Wrap},
 };
+use tui_logger::TuiLoggerSmartWidget;
 
 use crate::app::{App, ConnectionState, CurrentView, FocusedPane, QueryResultState, TableViewState};
 use crate::dotline::{make_color_fn, AsciiDotGraph};
@@ -83,19 +84,31 @@ fn render_main_layout(app: &App, area: Rect, buf: &mut Buffer) {
     let inner = main_block.inner(area);
     main_block.render(area, buf);
 
-    let outer_layout = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
-    let vertical_layout = Layout::vertical([Constraint::Percentage(70), Constraint::Percentage(30)])
-        .split(outer_layout[0]);
+    // Outer: content + status bar
+    let outer = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
+
+    // Main area: 70% top, 30% bottom (for logs)
+    let main_vertical = Layout::vertical([Constraint::Percentage(70), Constraint::Percentage(30)])
+        .split(outer[0]);
+
+    // Top area: 30% left sidebar + 70% right content
     let top_horizontal = Layout::horizontal([Constraint::Percentage(30), Constraint::Percentage(70)])
-        .split(vertical_layout[0]);
+        .split(main_vertical[0]);
+
+    // Right content: 70% results + 30% SQL editor
+    let right_stack = Layout::vertical([Constraint::Percentage(70), Constraint::Percentage(30)])
+        .split(top_horizontal[1]);
+
+    // Bottom area: 30% live monitor + 70% logs
     let bottom_horizontal = Layout::horizontal([Constraint::Percentage(30), Constraint::Percentage(70)])
-        .split(vertical_layout[1]);
+        .split(main_vertical[1]);
 
     render_sidebar(app, top_horizontal[0], buf);
-    render_content_area(app, top_horizontal[1], buf);
+    render_content_area(app, right_stack[0], buf);
+    render_sql_editor(app, right_stack[1], buf);
     render_stats_panel(app, bottom_horizontal[0], buf);
-    render_sql_editor(app, bottom_horizontal[1], buf);
-    render_global_status_bar(app, outer_layout[1], buf);
+    render_logs_panel(app, bottom_horizontal[1], buf);
+    render_global_status_bar(app, outer[1], buf);
 }
 
 fn render_global_status_bar(app: &App, area: Rect, buf: &mut Buffer) {
@@ -281,6 +294,31 @@ fn render_stats_info(app: &App, area: Rect, buf: &mut Buffer) {
         )),
     ];
     Paragraph::new(lines).render(area, buf);
+}
+
+fn render_logs_panel(app: &App, area: Rect, buf: &mut Buffer) {
+    let is_focused = app.focused_pane == FocusedPane::Logs;
+    let border_color = if is_focused { Color::Yellow } else { Color::Rgb(60, 60, 60) };
+
+    let block = Block::bordered()
+        .title(" 󰌱 DB Logs ")
+        .title_style(Style::default().fg(Color::Cyan).bold())
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border_color));
+
+    let inner = block.inner(area);
+    block.render(area, buf);
+
+    // Use TuiLoggerSmartWidget for scrollable log view
+    let logs_widget = TuiLoggerSmartWidget::default()
+        .style_error(Style::default().fg(Color::Red))
+        .style_warn(Style::default().fg(Color::Yellow))
+        .style_info(Style::default().fg(Color::Cyan))
+        .style_debug(Style::default().fg(Color::Green))
+        .style_trace(Style::default().fg(Color::DarkGray))
+        .state(&app.logs_state);
+
+    logs_widget.render(inner, buf);
 }
 
 fn latency_color(ms: u64) -> Style {

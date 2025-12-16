@@ -10,6 +10,7 @@ use std::env;
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 use tracing::{debug, info};
+use tui_logger::TuiWidgetState;
 use tui_textarea::TextArea;
 
 pub const PAGE_SIZE: usize = 50;
@@ -86,35 +87,39 @@ pub enum CurrentView {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FocusedPane {
     Sidebar,
-    Results,
     Stats,
+    Logs,
+    Results,
     Editor,
 }
 
 impl FocusedPane {
     pub fn next(self) -> Self {
         match self {
-            Self::Sidebar => Self::Results,
-            Self::Results => Self::Stats,
-            Self::Stats => Self::Editor,
-            Self::Editor => Self::Sidebar,
+            Self::Sidebar => Self::Stats,
+            Self::Stats => Self::Results,
+            Self::Results => Self::Editor,
+            Self::Editor => Self::Logs,
+            Self::Logs => Self::Sidebar,
         }
     }
 
     pub fn prev(self) -> Self {
         match self {
-            Self::Sidebar => Self::Editor,
-            Self::Results => Self::Sidebar,
-            Self::Stats => Self::Results,
-            Self::Editor => Self::Stats,
+            Self::Sidebar => Self::Logs,
+            Self::Stats => Self::Sidebar,
+            Self::Results => Self::Stats,
+            Self::Editor => Self::Results,
+            Self::Logs => Self::Editor,
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Sidebar => "Tables",
-            Self::Results => "Results",
             Self::Stats => "Stats",
+            Self::Logs => "Logs",
+            Self::Results => "Results",
             Self::Editor => "SQL",
         }
     }
@@ -214,6 +219,7 @@ pub struct App {
     pub show_query_results: bool,
     pub stats: StatsState,
     pub stats_scroll_offset: usize,
+    pub logs_state: TuiWidgetState,
 }
 
 impl std::fmt::Debug for App {
@@ -296,6 +302,7 @@ impl App {
                 rows_this_second: 0,
             },
             stats_scroll_offset: 0,
+            logs_state: TuiWidgetState::default(),
         }
     }
 
@@ -345,6 +352,17 @@ impl App {
                     self.stats_scroll_offset = self.stats_scroll_offset.saturating_sub((-delta) as usize);
                 } else {
                     self.stats_scroll_offset += delta as usize;
+                }
+            }
+            FocusedPane::Logs => {
+                use tui_logger::TuiWidgetEvent;
+                for _ in 0..delta.unsigned_abs() {
+                    let event = if delta < 0 {
+                        TuiWidgetEvent::UpKey
+                    } else {
+                        TuiWidgetEvent::DownKey
+                    };
+                    self.logs_state.transition(event);
                 }
             }
         }
@@ -671,7 +689,36 @@ impl App {
                 }
                 Ok(())
             }
+            FocusedPane::Logs => self.handle_logs_keys(key_event),
         }
+    }
+
+    fn handle_logs_keys(&mut self, key_event: KeyEvent) -> color_eyre::Result<()> {
+        use tui_logger::TuiWidgetEvent;
+
+        let event = match key_event.code {
+            KeyCode::Char('q') => {
+                self.running = false;
+                return Ok(());
+            }
+            KeyCode::Up | KeyCode::Char('k') => Some(TuiWidgetEvent::UpKey),
+            KeyCode::Down | KeyCode::Char('j') => Some(TuiWidgetEvent::DownKey),
+            KeyCode::PageUp => Some(TuiWidgetEvent::PrevPageKey),
+            KeyCode::PageDown => Some(TuiWidgetEvent::NextPageKey),
+            KeyCode::Left | KeyCode::Char('h') => Some(TuiWidgetEvent::LeftKey),
+            KeyCode::Right | KeyCode::Char('l') => Some(TuiWidgetEvent::RightKey),
+            KeyCode::Char('+') => Some(TuiWidgetEvent::PlusKey),
+            KeyCode::Char('-') => Some(TuiWidgetEvent::MinusKey),
+            KeyCode::Char(' ') => Some(TuiWidgetEvent::SpaceKey),
+            KeyCode::Esc => Some(TuiWidgetEvent::EscapeKey),
+            KeyCode::Home => Some(TuiWidgetEvent::FocusKey),
+            _ => None,
+        };
+
+        if let Some(e) = event {
+            self.logs_state.transition(e);
+        }
+        Ok(())
     }
 
     fn handle_editor_keys(&mut self, key_event: KeyEvent) -> color_eyre::Result<()> {
