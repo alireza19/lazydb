@@ -19,14 +19,10 @@ async fn main() -> color_eyre::Result<()> {
     let database_url = cli.get_database_url()?;
 
     let terminal = ratatui::init();
-
-    // Enable bracketed paste mode for instant paste handling
-    // Enable mouse capture for scroll wheel support
     execute!(stdout(), EnableBracketedPaste, EnableMouseCapture)?;
 
     let result = App::new(database_url).run(terminal).await;
 
-    // Disable mouse capture and bracketed paste mode before restoring terminal
     let _ = execute!(stdout(), DisableMouseCapture, DisableBracketedPaste);
     ratatui::restore();
 
