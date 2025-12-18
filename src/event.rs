@@ -47,6 +47,36 @@ pub struct StatsUpdate {
     pub total_rows: i64,
 }
 
+/// Column information from information_schema.
+#[derive(Debug, Clone)]
+pub struct DbColumn {
+    pub name: String,
+    pub data_type: String,
+    pub is_nullable: bool,
+    pub is_primary_key: bool,
+    pub ordinal_position: i32,
+}
+
+/// Table with its columns.
+#[derive(Debug, Clone)]
+pub struct DbTable {
+    pub name: String,
+    pub columns: Vec<DbColumn>,
+}
+
+/// Schema with its tables.
+#[derive(Debug, Clone)]
+pub struct DbSchema {
+    pub name: String,
+    pub tables: Vec<DbTable>,
+}
+
+/// Full database structure.
+#[derive(Debug, Clone)]
+pub struct DatabaseStructure {
+    pub schemas: Vec<DbSchema>,
+}
+
 /// Application events.
 #[derive(Debug)]
 pub enum AppEvent {
@@ -54,8 +84,10 @@ pub enum AppEvent {
     Quit,
     /// Database connection result.
     ConnectionResult(Result<(PgPool, String), String>),
-    /// Tables loaded from database.
+    /// Tables loaded from database (legacy, kept for compatibility).
     TablesLoaded(Vec<String>),
+    /// Full database schema structure loaded.
+    SchemaLoaded(DatabaseStructure),
     /// Table data loaded.
     TableDataLoaded(Result<TableDataResult, String>),
     /// SQL query execution result.

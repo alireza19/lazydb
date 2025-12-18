@@ -1,4 +1,7 @@
-use crate::event::{AppEvent, Event, EventHandler, QueryResult, StatsUpdate, TableDataResult};
+use crate::event::{
+    AppEvent, DatabaseStructure, DbColumn, DbSchema, DbTable, Event, EventHandler, QueryResult,
+    StatsUpdate, TableDataResult,
+};
 use clap::Parser;
 use ratatui::{
     crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
@@ -12,10 +15,20 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info};
 use tui_logger::TuiWidgetState;
 use tui_textarea::TextArea;
+use tui_tree_widget::TreeState;
 
 pub const PAGE_SIZE: usize = 50;
 pub const MAX_HISTORY: usize = 20;
 pub const DEFAULT_VISIBLE_ROWS: usize = 15;
+pub const SCHEMA_REFRESH_SECS: u64 = 10;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum TreeNodeId {
+    Root,
+    Schema(String),
+    Table { schema: String, table: String },
+    Column { schema: String, table: String, column: String },
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "lazydb")]
@@ -27,11 +40,12 @@ pub struct Cli {
 
 impl Cli {
     pub fn get_database_url(&self) -> color_eyre::Result<String> {
-        if let Some(url) = &self.database_url {
-            return Ok(url.clone());
-        }
-        env::var("DATABASE_URL")
-            .map_err(|_| color_eyre::eyre::eyre!("DATABASE_URL not set. Provide --url or set DATABASE_URL environment variable."))
+        self.database_url.clone().map_or_else(
+            || env::var("DATABASE_URL").map_err(|_| {
+                color_eyre::eyre::eyre!("DATABASE_URL not set. Provide --url or set DATABASE_URL environment variable.")
+            }),
+            Ok,
+        )
     }
 }
 
@@ -57,11 +71,7 @@ pub struct TableViewState {
 
 impl TableViewState {
     pub fn total_pages(&self) -> usize {
-        if self.total_count == 0 {
-            1
-        } else {
-            (self.total_count as usize).div_ceil(PAGE_SIZE)
-        }
+        if self.total_count == 0 { 1 } else { (self.total_count as usize).div_ceil(PAGE_SIZE) }
     }
 
     pub fn ensure_visible(&mut self, visible_rows: usize) {
@@ -205,8 +215,8 @@ pub struct App {
     pub selected_table_index: usize,
     pub sidebar_scroll_offset: usize,
     pub events: EventHandler,
-    refresh_handle: Option<JoinHandle<()>>,
     stats_handle: Option<JoinHandle<()>>,
+    schema_handle: Option<JoinHandle<()>>,
     pub focused_pane: FocusedPane,
     pub sql_editor: TextArea<'static>,
     pub editor_scroll_offset: usize,
@@ -220,6 +230,9 @@ pub struct App {
     pub stats: StatsState,
     pub stats_scroll_offset: usize,
     pub logs_state: TuiWidgetState,
+    pub db_structure: Option<DatabaseStructure>,
+    pub tree_state: TreeState<TreeNodeId>,
+    pub selected_table: Option<(String, String)>,
 }
 
 impl std::fmt::Debug for App {
@@ -233,19 +246,19 @@ impl std::fmt::Debug for App {
             .field("focused_pane", &self.focused_pane)
             .field("query_executing", &self.query_executing)
             .field("stats", &self.stats)
+            .field("db_structure", &self.db_structure)
+            .field("selected_table", &self.selected_table)
             .finish()
     }
 }
 
 fn parse_host_from_url(url: &str) -> String {
-    if let Some(at_pos) = url.find('@') {
-        let after_at = &url[at_pos + 1..];
-        if let Some(slash_pos) = after_at.find('/') {
-            return after_at[..slash_pos].to_string();
-        }
-        return after_at.to_string();
-    }
-    "localhost".to_string()
+    url.find('@')
+        .map(|at| {
+            let after = &url[at + 1..];
+            after.find('/').map_or(after, |slash| &after[..slash]).to_string()
+        })
+        .unwrap_or_else(|| "localhost".to_string())
 }
 
 impl App {
@@ -273,8 +286,8 @@ impl App {
             selected_table_index: 0,
             sidebar_scroll_offset: 0,
             events,
-            refresh_handle: None,
             stats_handle: None,
+            schema_handle: None,
             focused_pane: FocusedPane::Sidebar,
             sql_editor,
             editor_scroll_offset: 0,
@@ -303,6 +316,9 @@ impl App {
             },
             stats_scroll_offset: 0,
             logs_state: TuiWidgetState::default(),
+            db_structure: None,
+            tree_state: TreeState::default(),
+            selected_table: None,
         }
     }
 
@@ -344,62 +360,45 @@ impl App {
 
     fn scroll_focused_pane(&mut self, delta: i32) {
         match self.focused_pane {
-            FocusedPane::Sidebar => self.scroll_sidebar(delta),
+            FocusedPane::Sidebar => self.tree_navigate(delta),
             FocusedPane::Results => self.scroll_results(delta),
             FocusedPane::Editor => self.scroll_editor(delta),
             FocusedPane::Stats => {
-                if delta < 0 {
-                    self.stats_scroll_offset = self.stats_scroll_offset.saturating_sub((-delta) as usize);
+                self.stats_scroll_offset = if delta < 0 {
+                    self.stats_scroll_offset.saturating_sub((-delta) as usize)
                 } else {
-                    self.stats_scroll_offset += delta as usize;
-                }
+                    self.stats_scroll_offset + delta as usize
+                };
             }
             FocusedPane::Logs => {
                 use tui_logger::TuiWidgetEvent;
+                let event = if delta < 0 { TuiWidgetEvent::UpKey } else { TuiWidgetEvent::DownKey };
                 for _ in 0..delta.unsigned_abs() {
-                    let event = if delta < 0 {
-                        TuiWidgetEvent::UpKey
-                    } else {
-                        TuiWidgetEvent::DownKey
-                    };
                     self.logs_state.transition(event);
                 }
             }
         }
     }
 
-    fn scroll_sidebar(&mut self, delta: i32) {
-        if self.tables.is_empty() {
-            return;
-        }
-        self.selected_table_index = if delta < 0 {
-            self.selected_table_index.saturating_sub((-delta) as usize)
-        } else {
-            (self.selected_table_index + delta as usize).min(self.tables.len().saturating_sub(1))
-        };
-    }
-
     fn scroll_results(&mut self, delta: i32) {
         if self.show_query_results {
-            if let Some(ref mut qr) = self.query_result {
-                if qr.rows.is_empty() {
-                    return;
-                }
+            if let Some(ref mut qr) = self.query_result
+                && !qr.rows.is_empty()
+            {
                 qr.selected_row = if delta < 0 {
                     qr.selected_row.saturating_sub((-delta) as usize)
                 } else {
-                    (qr.selected_row + delta as usize).min(qr.rows.len().saturating_sub(1))
+                    (qr.selected_row + delta as usize).min(qr.rows.len() - 1)
                 };
                 qr.ensure_visible(DEFAULT_VISIBLE_ROWS);
             }
-        } else if let CurrentView::TableView(ref mut state) = self.current_view {
-            if state.rows.is_empty() {
-                return;
-            }
+        } else if let CurrentView::TableView(ref mut state) = self.current_view
+            && !state.rows.is_empty()
+        {
             state.selected_row = if delta < 0 {
                 state.selected_row.saturating_sub((-delta) as usize)
             } else {
-                (state.selected_row + delta as usize).min(state.rows.len().saturating_sub(1))
+                (state.selected_row + delta as usize).min(state.rows.len() - 1)
             };
             state.ensure_visible(DEFAULT_VISIBLE_ROWS);
         }
@@ -409,11 +408,7 @@ impl App {
         if self.sql_editor.lines().is_empty() {
             return;
         }
-        let movement = if delta < 0 {
-            tui_textarea::CursorMove::Up
-        } else {
-            tui_textarea::CursorMove::Down
-        };
+        let movement = if delta < 0 { tui_textarea::CursorMove::Up } else { tui_textarea::CursorMove::Down };
         for _ in 0..delta.unsigned_abs() {
             self.sql_editor.move_cursor(movement);
         }
@@ -439,8 +434,8 @@ impl App {
                     let sender = self.events.sender();
                     let pool_clone = pool.clone();
                     tokio::spawn(async move {
-                        let tables = fetch_tables(&pool_clone).await;
-                        let _ = sender.send(Event::App(AppEvent::TablesLoaded(tables)));
+                        let structure = fetch_database_structure(&pool_clone).await;
+                        let _ = sender.send(Event::App(AppEvent::SchemaLoaded(structure)));
                     });
                     self.stats.database = db_name.clone();
                     self.start_stats_task(&pool);
@@ -459,15 +454,34 @@ impl App {
                     self.selected_table_index = previously_selected
                         .and_then(|name| self.tables.iter().position(|t| t == &name))
                         .unwrap_or(0);
-                    debug!("refreshed table list – {} tables", self.tables.len());
                 }
-                if self.refresh_handle.is_none() {
-                    self.start_refresh_task();
+            }
+            AppEvent::SchemaLoaded(structure) => {
+                let table_count: usize = structure.schemas.iter().map(|s| s.tables.len()).sum();
+                self.stats.table_count = table_count;
+
+                self.tables = structure
+                    .schemas
+                    .iter()
+                    .find(|s| s.name == "public")
+                    .map(|s| s.tables.iter().map(|t| t.name.clone()).collect())
+                    .unwrap_or_default();
+
+                self.db_structure = Some(structure);
+
+                if self.tree_state.selected().is_empty() {
+                    self.tree_state.select(vec![TreeNodeId::Root]);
+                    self.tree_state.open(vec![TreeNodeId::Root]);
+                    self.tree_state.open(vec![TreeNodeId::Root, TreeNodeId::Schema("public".to_string())]);
+                }
+
+                if self.schema_handle.is_none() {
+                    self.start_schema_refresh_task();
                 }
             }
             AppEvent::TableDataLoaded(result) => {
                 if let CurrentView::TableView(ref mut state) = self.current_view {
-                    match result {
+                match result {
                         Ok(data) if state.table_name == data.table_name && state.page == data.page => {
                             state.columns = data.columns;
                             state.rows = data.rows;
@@ -476,9 +490,9 @@ impl App {
                             state.error = None;
                             if state.selected_row >= state.rows.len() && !state.rows.is_empty() {
                                 state.selected_row = state.rows.len() - 1;
-                            }
                         }
-                        Err(error) => {
+                    }
+                    Err(error) => {
                             state.loading = false;
                             state.error = Some(error);
                         }
@@ -530,28 +544,26 @@ impl App {
         }
     }
 
-    fn start_refresh_task(&mut self) {
-        let ConnectionState::Connected { pool, .. } = &self.connection else {
-            return;
-        };
-        let pool = pool.clone();
-        let sender = self.events.sender();
+    fn start_schema_refresh_task(&mut self) {
+        let ConnectionState::Connected { pool, .. } = &self.connection else { return };
+            let pool = pool.clone();
+            let sender = self.events.sender();
 
-        let handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(3));
-            interval.tick().await;
-            loop {
+            let handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(SCHEMA_REFRESH_SECS));
                 interval.tick().await;
+                loop {
+                    interval.tick().await;
                 if sender.is_closed() || pool.is_closed() {
-                    break;
+                        break;
+                    }
+                let structure = fetch_database_structure(&pool).await;
+                if sender.send(Event::App(AppEvent::SchemaLoaded(structure))).is_err() {
+                        break;
+                    }
                 }
-                let tables = fetch_tables(&pool).await;
-                if sender.send(Event::App(AppEvent::TablesLoaded(tables))).is_err() {
-                    break;
-                }
-            }
-        });
-        self.refresh_handle = Some(handle);
+            });
+        self.schema_handle = Some(handle);
     }
 
     fn start_stats_task(&mut self, pool: &PgPool) {
@@ -591,17 +603,15 @@ impl App {
     }
 
     fn fetch_table_data(&self, table_name: &str, page: usize) {
-        let ConnectionState::Connected { pool, .. } = &self.connection else {
-            return;
-        };
-        let pool = pool.clone();
-        let sender = self.events.sender();
-        let table_name = table_name.to_string();
+        let ConnectionState::Connected { pool, .. } = &self.connection else { return };
+            let pool = pool.clone();
+            let sender = self.events.sender();
+            let table_name = table_name.to_string();
 
-        tokio::spawn(async move {
-            let result = fetch_table_page(&pool, &table_name, page).await;
-            let _ = sender.send(Event::App(AppEvent::TableDataLoaded(result)));
-        });
+            tokio::spawn(async move {
+                let result = fetch_table_page(&pool, &table_name, page).await;
+                let _ = sender.send(Event::App(AppEvent::TableDataLoaded(result)));
+            });
     }
 
     fn execute_query(&mut self) {
@@ -619,37 +629,18 @@ impl App {
         self.history_index = None;
         self.saved_editor_content = None;
 
-        let ConnectionState::Connected { pool, .. } = &self.connection else {
-            return;
-        };
-        let pool = pool.clone();
-        let sender = self.events.sender();
+        let ConnectionState::Connected { pool, .. } = &self.connection else { return };
+            let pool = pool.clone();
+            let sender = self.events.sender();
 
-        self.query_executing = true;
-        self.query_start_time = Some(Instant::now());
-        info!("Executing query: {}", query);
+            self.query_executing = true;
+            self.query_start_time = Some(Instant::now());
+            info!("Executing query: {}", query);
 
-        tokio::spawn(async move {
-            let result = execute_sql_query(&pool, &query).await;
-            let _ = sender.send(Event::App(AppEvent::QueryExecuted(result)));
-        });
-    }
-
-    fn open_table(&mut self, table_name: &str) {
-        info!("Opening table: {}", table_name);
-        self.show_query_results = false;
-        self.current_view = CurrentView::TableView(TableViewState {
-            table_name: table_name.to_string(),
-            columns: Vec::new(),
-            rows: Vec::new(),
-            total_count: 0,
-            page: 0,
-            selected_row: 0,
-            scroll_offset: 0,
-            loading: true,
-            error: None,
-        });
-        self.fetch_table_data(table_name, 0);
+            tokio::spawn(async move {
+                let result = execute_sql_query(&pool, &query).await;
+                let _ = sender.send(Event::App(AppEvent::QueryExecuted(result)));
+            });
     }
 
     pub fn handle_key_events(&mut self, key_event: KeyEvent) -> color_eyre::Result<()> {
@@ -731,7 +722,8 @@ impl App {
             return Ok(());
         }
 
-        if key_event.code == KeyCode::Esc {
+        match key_event.code {
+            KeyCode::Esc => {
             self.focused_pane = if self.show_query_results || matches!(self.current_view, CurrentView::TableView(_)) {
                 FocusedPane::Results
             } else {
@@ -739,49 +731,45 @@ impl App {
             };
             return Ok(());
         }
-
-        if key_event.code == KeyCode::PageUp {
-            for _ in 0..DEFAULT_VISIBLE_ROWS {
-                self.sql_editor.move_cursor(tui_textarea::CursorMove::Up);
+            KeyCode::PageUp => {
+                for _ in 0..DEFAULT_VISIBLE_ROWS {
+                    self.sql_editor.move_cursor(tui_textarea::CursorMove::Up);
+                }
+                self.update_editor_scroll();
+                return Ok(());
             }
-            self.update_editor_scroll();
-            return Ok(());
-        }
-
-        if key_event.code == KeyCode::PageDown {
-            for _ in 0..DEFAULT_VISIBLE_ROWS {
-                self.sql_editor.move_cursor(tui_textarea::CursorMove::Down);
+            KeyCode::PageDown => {
+                for _ in 0..DEFAULT_VISIBLE_ROWS {
+                    self.sql_editor.move_cursor(tui_textarea::CursorMove::Down);
+                }
+                self.update_editor_scroll();
+                return Ok(());
             }
-            self.update_editor_scroll();
-            return Ok(());
-        }
-
-        if key_event.code == KeyCode::Home && key_event.modifiers.contains(KeyModifiers::CONTROL) {
-            self.sql_editor.move_cursor(tui_textarea::CursorMove::Top);
-            self.editor_scroll_offset = 0;
-            return Ok(());
-        }
-
-        if key_event.code == KeyCode::End && key_event.modifiers.contains(KeyModifiers::CONTROL) {
-            self.sql_editor.move_cursor(tui_textarea::CursorMove::Bottom);
-            self.update_editor_scroll();
-            return Ok(());
-        }
-
-        if key_event.code == KeyCode::Up && key_event.modifiers.is_empty() {
+            KeyCode::Home if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.sql_editor.move_cursor(tui_textarea::CursorMove::Top);
+                self.editor_scroll_offset = 0;
+                return Ok(());
+            }
+            KeyCode::End if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.sql_editor.move_cursor(tui_textarea::CursorMove::Bottom);
+                self.update_editor_scroll();
+                return Ok(());
+            }
+            KeyCode::Up if key_event.modifiers.is_empty() => {
             let (row, _) = self.sql_editor.cursor();
             if row == 0 && !self.query_history.is_empty() {
                 self.navigate_history_up();
                 return Ok(());
             }
         }
-
-        if key_event.code == KeyCode::Down && key_event.modifiers.is_empty() {
+            KeyCode::Down if key_event.modifiers.is_empty() => {
             let (row, _) = self.sql_editor.cursor();
-            if row >= self.sql_editor.lines().len().saturating_sub(1) && self.history_index.is_some() {
+                if row >= self.sql_editor.lines().len().saturating_sub(1) && self.history_index.is_some() {
                 self.navigate_history_down();
                 return Ok(());
             }
+            }
+            _ => {}
         }
 
         self.sql_editor.input(key_event);
@@ -824,66 +812,207 @@ impl App {
         }
     }
 
-    fn ensure_sidebar_visible(&mut self, visible_rows: usize) {
-        if visible_rows == 0 || self.tables.is_empty() {
-            return;
-        }
-        if self.selected_table_index < self.sidebar_scroll_offset {
-            self.sidebar_scroll_offset = self.selected_table_index;
-        }
-        if self.selected_table_index >= self.sidebar_scroll_offset + visible_rows {
-            self.sidebar_scroll_offset = self.selected_table_index.saturating_sub(visible_rows - 1);
-        }
-    }
-
     fn handle_sidebar_keys(&mut self, key_event: KeyEvent) -> color_eyre::Result<()> {
         match key_event.code {
-            KeyCode::Esc | KeyCode::Char('q') => {
-                self.running = false;
-            }
-            KeyCode::Up | KeyCode::Char('k') if !self.tables.is_empty() => {
-                if self.selected_table_index > 0 {
-                    self.selected_table_index -= 1;
-                } else {
-                    self.selected_table_index = self.tables.len() - 1;
-                    self.sidebar_scroll_offset = self.tables.len().saturating_sub(DEFAULT_VISIBLE_ROWS);
+            KeyCode::Esc | KeyCode::Char('q') => self.running = false,
+            KeyCode::Up | KeyCode::Char('k') => self.tree_navigate(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.tree_navigate(1),
+            KeyCode::Left | KeyCode::Char('h') => self.tree_collapse(),
+            KeyCode::Right | KeyCode::Char('l') => self.tree_expand_or_open(),
+            KeyCode::Enter | KeyCode::Char(' ') => self.handle_tree_enter(),
+            KeyCode::Char('r') => self.refresh_schema(),
+            KeyCode::PageUp => self.tree_navigate(-(DEFAULT_VISIBLE_ROWS as i32)),
+            KeyCode::PageDown => self.tree_navigate(DEFAULT_VISIBLE_ROWS as i32),
+            KeyCode::Home => {
+                if let Some(first) = self.get_visible_tree_paths().first() {
+                    self.tree_state.select(first.clone());
                 }
-                self.ensure_sidebar_visible(DEFAULT_VISIBLE_ROWS);
             }
-            KeyCode::Down | KeyCode::Char('j') if !self.tables.is_empty() => {
-                if self.selected_table_index < self.tables.len() - 1 {
-                    self.selected_table_index += 1;
-                } else {
-                    self.selected_table_index = 0;
-                    self.sidebar_scroll_offset = 0;
+            KeyCode::End => {
+                if let Some(last) = self.get_visible_tree_paths().last() {
+                    self.tree_state.select(last.clone());
                 }
-                self.ensure_sidebar_visible(DEFAULT_VISIBLE_ROWS);
-            }
-            KeyCode::PageUp if !self.tables.is_empty() => {
-                self.selected_table_index = self.selected_table_index.saturating_sub(DEFAULT_VISIBLE_ROWS);
-                self.ensure_sidebar_visible(DEFAULT_VISIBLE_ROWS);
-            }
-            KeyCode::PageDown if !self.tables.is_empty() => {
-                self.selected_table_index = (self.selected_table_index + DEFAULT_VISIBLE_ROWS)
-                    .min(self.tables.len().saturating_sub(1));
-                self.ensure_sidebar_visible(DEFAULT_VISIBLE_ROWS);
-            }
-            KeyCode::Home if !self.tables.is_empty() => {
-                self.selected_table_index = 0;
-                self.sidebar_scroll_offset = 0;
-            }
-            KeyCode::End if !self.tables.is_empty() => {
-                self.selected_table_index = self.tables.len() - 1;
-                self.sidebar_scroll_offset = self.tables.len().saturating_sub(DEFAULT_VISIBLE_ROWS);
-            }
-            KeyCode::Enter if !self.tables.is_empty() => {
-                let table_name = self.tables[self.selected_table_index].clone();
-                self.open_table(&table_name);
-                self.focused_pane = FocusedPane::Results;
             }
             _ => {}
         }
         Ok(())
+    }
+
+    fn get_visible_tree_paths(&self) -> Vec<Vec<TreeNodeId>> {
+        let Some(structure) = &self.db_structure else { return vec![] };
+        let opened = self.tree_state.opened();
+        let mut paths = Vec::new();
+
+        let root_path = vec![TreeNodeId::Root];
+        paths.push(root_path.clone());
+
+        if !opened.iter().any(|p| p == &root_path) {
+            return paths;
+        }
+
+        for schema in &structure.schemas {
+            let schema_path = vec![TreeNodeId::Root, TreeNodeId::Schema(schema.name.clone())];
+            paths.push(schema_path.clone());
+
+            if !opened.iter().any(|p| p == &schema_path) {
+                continue;
+            }
+
+            for table in &schema.tables {
+                let table_path = vec![
+                    TreeNodeId::Root,
+                    TreeNodeId::Schema(schema.name.clone()),
+                    TreeNodeId::Table { schema: schema.name.clone(), table: table.name.clone() },
+                ];
+                paths.push(table_path.clone());
+
+                if !opened.iter().any(|p| p == &table_path) {
+                    continue;
+                }
+
+                for col in &table.columns {
+                    paths.push(vec![
+                        TreeNodeId::Root,
+                        TreeNodeId::Schema(schema.name.clone()),
+                        TreeNodeId::Table { schema: schema.name.clone(), table: table.name.clone() },
+                        TreeNodeId::Column { schema: schema.name.clone(), table: table.name.clone(), column: col.name.clone() },
+                    ]);
+                }
+            }
+        }
+        paths
+    }
+
+    fn tree_navigate(&mut self, delta: i32) {
+        let paths = self.get_visible_tree_paths();
+        if paths.is_empty() {
+            return;
+        }
+
+        let current = self.tree_state.selected();
+        let current_idx = paths.iter().position(|p| p == current).unwrap_or(0);
+        let new_idx = if delta < 0 {
+            current_idx.saturating_sub((-delta) as usize)
+                    } else {
+            (current_idx + delta as usize).min(paths.len() - 1)
+        };
+
+        if let Some(new_path) = paths.get(new_idx) {
+            self.tree_state.select(new_path.clone());
+        }
+    }
+
+    fn tree_collapse(&mut self) {
+        let selected = self.tree_state.selected().to_vec();
+        if selected.is_empty() {
+            return;
+        }
+
+        if self.tree_state.opened().iter().any(|p| *p == selected) {
+            self.tree_state.close(&selected);
+            return;
+        }
+
+        if selected.len() > 1 {
+            self.tree_state.select(selected[..selected.len() - 1].to_vec());
+        }
+    }
+
+    fn tree_expand_or_open(&mut self) {
+        let selected = self.tree_state.selected().to_vec();
+        if selected.is_empty() {
+            return;
+        }
+
+        let is_expanded = self.tree_state.opened().iter().any(|p| *p == selected);
+
+        match selected.last() {
+            Some(TreeNodeId::Root) | Some(TreeNodeId::Schema(_)) => {
+                if is_expanded {
+                    self.tree_navigate(1);
+                    } else {
+                    self.tree_state.open(selected);
+                }
+            }
+            Some(TreeNodeId::Table { schema, table }) => {
+                let (schema, table) = (schema.clone(), table.clone());
+                if is_expanded {
+                    self.open_schema_table(schema, table);
+                    self.focused_pane = FocusedPane::Results;
+                } else {
+                    self.tree_state.open(selected);
+                }
+            }
+            Some(TreeNodeId::Column { column, .. }) => {
+                self.sql_editor.insert_str(column);
+                self.focused_pane = FocusedPane::Editor;
+            }
+            None => {}
+        }
+    }
+
+    fn handle_tree_enter(&mut self) {
+        let selected = self.tree_state.selected().to_vec();
+        if selected.is_empty() {
+            return;
+        }
+
+        let is_open = self.tree_state.opened().iter().any(|p| *p == selected);
+
+        match selected.last() {
+            Some(TreeNodeId::Root) | Some(TreeNodeId::Schema(_)) => {
+                if is_open {
+                    self.tree_state.close(&selected);
+                } else {
+                    self.tree_state.open(selected);
+                }
+            }
+            Some(TreeNodeId::Table { schema, table }) => {
+                let (schema, table) = (schema.clone(), table.clone());
+                if is_open {
+                    self.open_schema_table(schema, table);
+                    self.focused_pane = FocusedPane::Results;
+                } else {
+                    self.tree_state.open(selected);
+                }
+            }
+            Some(TreeNodeId::Column { column, .. }) => {
+                self.sql_editor.insert_str(column);
+                self.focused_pane = FocusedPane::Editor;
+            }
+            None => {}
+        }
+    }
+
+    fn open_schema_table(&mut self, schema: String, table: String) {
+        info!("Opening table: {}.{}", schema, table);
+        self.show_query_results = false;
+        self.selected_table = Some((schema.clone(), table.clone()));
+
+        let full_name = if schema == "public" { table } else { format!("{}.{}", schema, table) };
+
+        self.current_view = CurrentView::TableView(TableViewState {
+            table_name: full_name.clone(),
+            columns: Vec::new(),
+            rows: Vec::new(),
+            total_count: 0,
+            page: 0,
+            selected_row: 0,
+            scroll_offset: 0,
+            loading: true,
+            error: None,
+        });
+        self.fetch_table_data(&full_name, 0);
+    }
+
+    fn refresh_schema(&mut self) {
+        let ConnectionState::Connected { pool, .. } = &self.connection else { return };
+        let pool = pool.clone();
+        let sender = self.events.sender();
+        tokio::spawn(async move {
+            let structure = fetch_database_structure(&pool).await;
+            let _ = sender.send(Event::App(AppEvent::SchemaLoaded(structure)));
+        });
     }
 
     fn handle_results_keys(&mut self, key_event: KeyEvent) -> color_eyre::Result<()> {
@@ -896,9 +1025,9 @@ impl App {
         if matches!(key_event.code, KeyCode::Char('b') | KeyCode::Esc)
             && matches!(self.current_view, CurrentView::TableView(_))
         {
-            self.current_view = CurrentView::TableList;
-            self.show_query_results = false;
-            self.focused_pane = FocusedPane::Sidebar;
+                self.current_view = CurrentView::TableList;
+                self.show_query_results = false;
+                self.focused_pane = FocusedPane::Sidebar;
             return Ok(());
         }
 
@@ -908,48 +1037,37 @@ impl App {
         }
 
         if self.show_query_results {
-            if let Some(ref mut qr) = self.query_result {
-                if !qr.rows.is_empty() {
-                    handle_list_navigation(
-                        key_event.code,
-                        &mut qr.selected_row,
-                        &mut qr.scroll_offset,
-                        qr.rows.len(),
-                    );
-                }
+            if let Some(ref mut qr) = self.query_result
+                && !qr.rows.is_empty()
+            {
+                handle_list_navigation(key_event.code, &mut qr.selected_row, &mut qr.scroll_offset, qr.rows.len());
             }
         } else if let CurrentView::TableView(state) = &mut self.current_view {
-            if !state.rows.is_empty() {
-                handle_list_navigation(
-                    key_event.code,
-                    &mut state.selected_row,
-                    &mut state.scroll_offset,
-                    state.rows.len(),
-                );
+                    if !state.rows.is_empty() {
+                handle_list_navigation(key_event.code, &mut state.selected_row, &mut state.scroll_offset, state.rows.len());
             }
+
             let mut fetch_page = None;
             match key_event.code {
                 KeyCode::Left | KeyCode::Char('h') if state.page > 0 && !state.loading => {
-                    state.page -= 1;
-                    state.loading = true;
-                    state.selected_row = 0;
-                    state.scroll_offset = 0;
-                    fetch_page = Some((state.table_name.clone(), state.page));
-                }
-                KeyCode::Right | KeyCode::Char('l')
-                    if state.page < state.total_pages().saturating_sub(1) && !state.loading =>
-                {
-                    state.page += 1;
-                    state.loading = true;
-                    state.selected_row = 0;
-                    state.scroll_offset = 0;
-                    fetch_page = Some((state.table_name.clone(), state.page));
+                        state.page -= 1;
+                        state.loading = true;
+                        state.selected_row = 0;
+                        state.scroll_offset = 0;
+                        fetch_page = Some((state.table_name.clone(), state.page));
+                    }
+                KeyCode::Right | KeyCode::Char('l') if state.page < state.total_pages().saturating_sub(1) && !state.loading => {
+                        state.page += 1;
+                        state.loading = true;
+                        state.selected_row = 0;
+                        state.scroll_offset = 0;
+                        fetch_page = Some((state.table_name.clone(), state.page));
                 }
                 _ => {}
             }
-            if let Some((table_name, page)) = fetch_page {
-                self.fetch_table_data(&table_name, page);
-            }
+        if let Some((table_name, page)) = fetch_page {
+            self.fetch_table_data(&table_name, page);
+        }
         }
         Ok(())
     }
@@ -959,46 +1077,33 @@ impl App {
     }
 }
 
-fn handle_list_navigation(
-    code: KeyCode,
-    selected: &mut usize,
-    scroll_offset: &mut usize,
-    len: usize,
-) {
+fn handle_list_navigation(code: KeyCode, selected: &mut usize, scroll_offset: &mut usize, len: usize) {
     match code {
         KeyCode::Up | KeyCode::Char('k') => {
-            if *selected > 0 {
-                *selected -= 1;
-            } else {
-                *selected = len - 1;
+            *selected = if *selected > 0 { *selected - 1 } else { len - 1 };
+            if *selected == len - 1 {
                 *scroll_offset = len.saturating_sub(DEFAULT_VISIBLE_ROWS);
             }
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            if *selected < len - 1 {
-                *selected += 1;
-            } else {
-                *selected = 0;
+            *selected = if *selected < len - 1 { *selected + 1 } else { 0 };
+            if *selected == 0 {
                 *scroll_offset = 0;
             }
         }
-        KeyCode::PageUp => {
-            *selected = selected.saturating_sub(DEFAULT_VISIBLE_ROWS);
-        }
-        KeyCode::PageDown => {
-            *selected = (*selected + DEFAULT_VISIBLE_ROWS).min(len.saturating_sub(1));
-        }
+        KeyCode::PageUp => *selected = selected.saturating_sub(DEFAULT_VISIBLE_ROWS),
+        KeyCode::PageDown => *selected = (*selected + DEFAULT_VISIBLE_ROWS).min(len - 1),
         KeyCode::Home => {
             *selected = 0;
             *scroll_offset = 0;
         }
         KeyCode::End => {
-            *selected = len.saturating_sub(1);
+            *selected = len - 1;
             *scroll_offset = len.saturating_sub(DEFAULT_VISIBLE_ROWS);
         }
         _ => return,
     }
-    // ensure_visible inline
+
     if *selected < *scroll_offset {
         *scroll_offset = *selected;
     }
@@ -1024,12 +1129,8 @@ fn is_execute_key_combo(key_event: &KeyEvent) -> bool {
 
 impl Drop for App {
     fn drop(&mut self) {
-        if let Some(handle) = self.refresh_handle.take() {
-            handle.abort();
-        }
-        if let Some(handle) = self.stats_handle.take() {
-            handle.abort();
-        }
+        if let Some(h) = self.stats_handle.take() { h.abort(); }
+        if let Some(h) = self.schema_handle.take() { h.abort(); }
     }
 }
 
@@ -1042,17 +1143,93 @@ async fn connect_to_database(url: &str) -> Result<(PgPool, String), String> {
     Ok((pool, db_name.0))
 }
 
-async fn fetch_tables(pool: &PgPool) -> Vec<String> {
-    sqlx::query_as::<_, (String,)>(
-        "SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename",
+async fn fetch_database_structure(pool: &PgPool) -> DatabaseStructure {
+    let schemas: Vec<String> = sqlx::query_as::<_, (String,)>(
+        r#"SELECT schema_name FROM information_schema.schemata 
+           WHERE schema_name NOT IN ('pg_catalog', 'pg_toast', 'information_schema')
+           ORDER BY CASE WHEN schema_name = 'public' THEN 0 ELSE 1 END, schema_name"#,
     )
     .fetch_all(pool)
     .await
     .map(|rows| rows.into_iter().map(|(name,)| name).collect())
-    .unwrap_or_else(|e| {
-        tracing::error!("Failed to fetch tables: {e}");
-        Vec::new()
-    })
+    .unwrap_or_else(|_| vec!["public".to_string()]);
+
+    let tables: Vec<(String, String)> = sqlx::query_as::<_, (String, String)>(
+        r#"SELECT table_schema, table_name FROM information_schema.tables 
+           WHERE table_type = 'BASE TABLE'
+             AND table_schema NOT IN ('pg_catalog', 'pg_toast', 'information_schema')
+           ORDER BY table_schema, table_name"#,
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    let columns: Vec<(String, String, String, String, String, i32)> = sqlx::query_as::<_, (String, String, String, String, String, i32)>(
+        r#"SELECT c.table_schema, c.table_name, c.column_name, c.data_type, c.is_nullable, c.ordinal_position
+           FROM information_schema.columns c
+           WHERE c.table_schema NOT IN ('pg_catalog', 'pg_toast', 'information_schema')
+           ORDER BY c.table_schema, c.table_name, c.ordinal_position"#,
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    let pk_columns: Vec<(String, String, String)> = sqlx::query_as::<_, (String, String, String)>(
+        r#"SELECT tc.table_schema, tc.table_name, kcu.column_name
+           FROM information_schema.table_constraints tc
+           JOIN information_schema.key_column_usage kcu
+               ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
+           WHERE tc.constraint_type = 'PRIMARY KEY'
+             AND tc.table_schema NOT IN ('pg_catalog', 'pg_toast', 'information_schema')"#,
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    use std::collections::{HashMap, HashSet};
+
+    let pk_set: HashSet<_> = pk_columns.into_iter().collect();
+    let mut schema_map: HashMap<String, Vec<DbTable>> = schemas.iter().map(|s| (s.clone(), Vec::new())).collect();
+    let mut table_map: HashMap<(String, String), Vec<DbColumn>> = tables.iter().map(|(s, t)| ((s.clone(), t.clone()), Vec::new())).collect();
+
+    for (schema, table, col_name, data_type, is_nullable, ordinal) in columns {
+        let col = DbColumn {
+            name: col_name.clone(),
+            data_type: format_data_type(&data_type),
+            is_nullable: is_nullable == "YES",
+            is_primary_key: pk_set.contains(&(schema.clone(), table.clone(), col_name)),
+            ordinal_position: ordinal,
+        };
+        if let Some(cols) = table_map.get_mut(&(schema, table)) {
+            cols.push(col);
+        }
+    }
+
+    for (schema, table) in tables {
+        let columns = table_map.remove(&(schema.clone(), table.clone())).unwrap_or_default();
+        if let Some(tables) = schema_map.get_mut(&schema) {
+            tables.push(DbTable { name: table, columns });
+        }
+    }
+
+    let db_schemas: Vec<DbSchema> = schemas
+        .into_iter()
+        .map(|name| DbSchema { tables: schema_map.remove(&name).unwrap_or_default(), name })
+        .collect();
+
+    DatabaseStructure { schemas: db_schemas }
+}
+
+fn format_data_type(data_type: &str) -> String {
+    match data_type {
+        "character varying" => "varchar".into(),
+        "character" => "char".into(),
+        "timestamp without time zone" => "timestamp".into(),
+        "timestamp with time zone" => "timestamptz".into(),
+        "double precision" => "float8".into(),
+        "boolean" => "bool".into(),
+        _ => data_type.into(),
+    }
 }
 
 async fn fetch_stats(pool: &PgPool) -> Option<StatsUpdate> {
@@ -1061,12 +1238,10 @@ async fn fetch_stats(pool: &PgPool) -> Option<StatsUpdate> {
         .await
         .ok()
         .map(|v: String| v.split_whitespace().take(2).collect::<Vec<_>>().join(" "))
-        .unwrap_or_else(|| "Unknown".to_string());
+        .unwrap_or_else(|| "Unknown".into());
 
     let total_rows: i64 = sqlx::query_scalar(
-        r#"SELECT COALESCE(SUM(n_live_tup), 0)::bigint 
-           FROM pg_stat_user_tables 
-           WHERE schemaname = 'public'"#,
+        r#"SELECT COALESCE(SUM(n_live_tup), 0)::bigint FROM pg_stat_user_tables WHERE schemaname = 'public'"#,
     )
     .fetch_one(pool)
     .await
@@ -1083,27 +1258,23 @@ async fn fetch_table_page(pool: &PgPool, table_name: &str, page: usize) -> Resul
         .await
         .map_err(|e| format!("Failed to get row count: {e}"))?;
 
-    let rows = sqlx::query(&format!(
-        r#"SELECT * FROM "{}" LIMIT {} OFFSET {}"#,
-        table_name, PAGE_SIZE, offset
-    ))
-    .fetch_all(pool)
-    .await
-    .map_err(|e| format!("Failed to fetch data: {e}"))?;
+    let rows = sqlx::query(&format!(r#"SELECT * FROM "{}" LIMIT {} OFFSET {}"#, table_name, PAGE_SIZE, offset))
+        .fetch_all(pool)
+        .await
+        .map_err(|e| format!("Failed to fetch data: {e}"))?;
 
     let columns: Vec<String> = if rows.is_empty() {
         sqlx::query_as::<_, (String,)>(&format!(
             r#"SELECT column_name FROM information_schema.columns 
-               WHERE table_schema = 'public' AND table_name = '{}' 
-               ORDER BY ordinal_position"#,
+               WHERE table_schema = 'public' AND table_name = '{}' ORDER BY ordinal_position"#,
             table_name
         ))
-        .fetch_all(pool)
-        .await
+            .fetch_all(pool)
+            .await
         .map_err(|e| format!("Failed to get column info: {e}"))?
         .into_iter()
         .map(|(name,)| name)
-        .collect()
+            .collect()
     } else {
         rows[0].columns().iter().map(|c| c.name().to_string()).collect()
     };
@@ -1134,14 +1305,7 @@ async fn execute_sql_query(pool: &PgPool, query: &str) -> Result<QueryResult, St
     let string_rows: Vec<Vec<String>> = rows.iter().map(|row| row_to_strings(row, columns.len())).collect();
     let row_count = string_rows.len();
 
-    Ok(QueryResult {
-        query: query.to_string(),
-        columns,
-        rows: string_rows,
-        row_count,
-        duration_ms,
-        is_explain,
-    })
+    Ok(QueryResult { query: query.to_string(), columns, rows: string_rows, row_count, duration_ms, is_explain })
 }
 
 fn row_to_strings(row: &sqlx::postgres::PgRow, col_count: usize) -> Vec<String> {
@@ -1152,12 +1316,12 @@ fn row_to_strings(row: &sqlx::postgres::PgRow, col_count: usize) -> Vec<String> 
                 .or_else(|_| row.try_get::<i32, _>(i).map(|v| v.to_string()))
                 .or_else(|_| row.try_get::<f64, _>(i).map(|v| v.to_string()))
                 .or_else(|_| row.try_get::<bool, _>(i).map(|v| v.to_string()))
-                .or_else(|_| row.try_get::<Option<String>, _>(i).map(|v| v.unwrap_or_else(|| "NULL".to_string())))
-                .or_else(|_| row.try_get::<Option<i64>, _>(i).map(|v| v.map_or("NULL".to_string(), |n| n.to_string())))
-                .or_else(|_| row.try_get::<Option<i32>, _>(i).map(|v| v.map_or("NULL".to_string(), |n| n.to_string())))
-                .or_else(|_| row.try_get::<Option<f64>, _>(i).map(|v| v.map_or("NULL".to_string(), |n| n.to_string())))
-                .or_else(|_| row.try_get::<Option<bool>, _>(i).map(|v| v.map_or("NULL".to_string(), |b| b.to_string())))
-                .unwrap_or_else(|_| "<?>".to_string())
+                .or_else(|_| row.try_get::<Option<String>, _>(i).map(|v| v.unwrap_or_else(|| "NULL".into())))
+                .or_else(|_| row.try_get::<Option<i64>, _>(i).map(|v| v.map_or("NULL".into(), |n| n.to_string())))
+                .or_else(|_| row.try_get::<Option<i32>, _>(i).map(|v| v.map_or("NULL".into(), |n| n.to_string())))
+                .or_else(|_| row.try_get::<Option<f64>, _>(i).map(|v| v.map_or("NULL".into(), |n| n.to_string())))
+                .or_else(|_| row.try_get::<Option<bool>, _>(i).map(|v| v.map_or("NULL".into(), |b| b.to_string())))
+                .unwrap_or_else(|_| "<?>".into())
         })
         .collect()
 }

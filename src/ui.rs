@@ -3,24 +3,26 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
-    widgets::{Block, BorderType, Cell, List, ListItem, ListState, Paragraph, Row, Table, Widget, Wrap},
+    widgets::{Block, BorderType, Cell, Paragraph, Row, Table, Widget, Wrap},
 };
 use tui_logger::TuiLoggerSmartWidget;
 
-use crate::app::{App, ConnectionState, CurrentView, FocusedPane, QueryResultState, TableViewState};
+use crate::app::{App, ConnectionState, CurrentView, FocusedPane, QueryResultState, TableViewState, TreeNodeId};
 use crate::dotline::{make_color_fn, AsciiDotGraph};
 
-// Theme colors
 const BORDER_NORMAL: Color = Color::White;
-const BORDER_FOCUSED: Color = Color::Rgb(255, 140, 0); // Bright orange
-const TITLE_COLOR: Color = Color::White;
+const BORDER_FOCUSED: Color = Color::Rgb(255, 140, 0);
 const TEXT_NORMAL: Color = Color::White;
 const TEXT_DIM: Color = Color::DarkGray;
 const TEXT_SUCCESS: Color = Color::Green;
 const TEXT_ERROR: Color = Color::Red;
-const SELECTED_BG: Color = Color::Rgb(255, 140, 0); // Orange
+const SELECTED_BG: Color = Color::Rgb(255, 140, 0);
 const SELECTED_FG: Color = Color::Black;
 const SEPARATOR: Color = Color::Rgb(80, 80, 80);
+const ICON_GRAY: Color = Color::Rgb(180, 180, 180);
+const PK_COLOR: Color = Color::Rgb(255, 200, 100);
+const NUMBER_COLOR: Color = Color::Rgb(255, 180, 100);
+const CURSOR_LINE_BG: Color = Color::Rgb(40, 40, 40);
 
 const SQL_KEYWORDS: &[&str] = &[
     "SELECT", "FROM", "WHERE", "AND", "OR", "NOT", "IN", "LIKE", "BETWEEN", "IS", "NULL",
@@ -33,6 +35,22 @@ const SQL_KEYWORDS: &[&str] = &[
     "WITH", "RECURSIVE", "RETURNING", "CONFLICT", "DO", "NOTHING", "TRUE", "FALSE",
 ];
 
+fn title_style() -> Style {
+    Style::default().fg(TEXT_NORMAL).add_modifier(Modifier::BOLD)
+}
+
+fn border_style(focused: bool) -> Style {
+    Style::default().fg(if focused { BORDER_FOCUSED } else { BORDER_NORMAL })
+}
+
+fn pane_block(title: &str, focused: bool) -> Block<'_> {
+    Block::bordered()
+        .title(title)
+        .title_style(title_style())
+        .border_type(BorderType::Rounded)
+        .border_style(border_style(focused))
+}
+
 impl Widget for &App {
     fn render(self, area: Rect, buf: &mut Buffer) {
         match &self.current_view {
@@ -43,13 +61,7 @@ impl Widget for &App {
 }
 
 fn render_connection_status(app: &App, area: Rect, buf: &mut Buffer) {
-    let block = Block::bordered()
-        .title(" lazydb ")
-        .title_alignment(Alignment::Center)
-        .title_style(Style::default().fg(TITLE_COLOR).add_modifier(Modifier::BOLD))
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(BORDER_NORMAL));
-
+    let block = pane_block(" lazydb ", false).title_alignment(Alignment::Center);
     let inner = block.inner(area);
     block.render(area, buf);
 
@@ -78,25 +90,19 @@ fn render_connection_status(app: &App, area: Rect, buf: &mut Buffer) {
 
     Paragraph::new(status_line).alignment(Alignment::Center).render(layout[1], buf);
 
-    let help_line = Line::from(vec![
+    Paragraph::new(Line::from(vec![
         Span::styled("Press ", Style::default().fg(TEXT_DIM)),
-        Span::styled("q", Style::default().fg(TEXT_NORMAL).add_modifier(Modifier::BOLD)),
+        Span::styled("q", Style::default().fg(TEXT_NORMAL).bold()),
         Span::styled(" to quit", Style::default().fg(TEXT_DIM)),
-    ]);
-
-    Paragraph::new(help_line).alignment(Alignment::Center).render(layout[2], buf);
+    ]))
+        .alignment(Alignment::Center)
+        .render(layout[2], buf);
 }
 
 fn render_main_layout(app: &App, area: Rect, buf: &mut Buffer) {
-    let main_block = Block::bordered()
-        .title(" lazydb ")
-        .title_alignment(Alignment::Center)
-        .title_style(Style::default().fg(TITLE_COLOR).add_modifier(Modifier::BOLD))
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(BORDER_NORMAL));
-
-    let inner = main_block.inner(area);
-    main_block.render(area, buf);
+    let block = pane_block(" lazydb ", false).title_alignment(Alignment::Center);
+    let inner = block.inner(area);
+    block.render(area, buf);
 
     let outer = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
     let main_vertical = Layout::vertical([Constraint::Percentage(70), Constraint::Percentage(30)])
@@ -117,11 +123,8 @@ fn render_main_layout(app: &App, area: Rect, buf: &mut Buffer) {
 }
 
 fn render_global_status_bar(app: &App, area: Rect, buf: &mut Buffer) {
-    let status = Line::from(vec![
-        Span::styled(
-            format!("[{}]", app.focused_pane.label()),
-            Style::default().fg(BORDER_FOCUSED).add_modifier(Modifier::BOLD),
-        ),
+    Paragraph::new(Line::from(vec![
+        Span::styled(format!("[{}]", app.focused_pane.label()), Style::default().fg(BORDER_FOCUSED).bold()),
         Span::styled(" │ ", Style::default().fg(SEPARATOR)),
         Span::styled("Tab", Style::default().fg(TEXT_NORMAL)),
         Span::styled(" cycle  ", Style::default().fg(TEXT_DIM)),
@@ -129,8 +132,9 @@ fn render_global_status_bar(app: &App, area: Rect, buf: &mut Buffer) {
         Span::styled(" SQL  ", Style::default().fg(TEXT_DIM)),
         Span::styled("q", Style::default().fg(TEXT_NORMAL)),
         Span::styled(" quit", Style::default().fg(TEXT_DIM)),
-    ]);
-    Paragraph::new(status).alignment(Alignment::Center).render(area, buf);
+    ]))
+        .alignment(Alignment::Center)
+        .render(area, buf);
 }
 
 fn render_sidebar(app: &App, area: Rect, buf: &mut Buffer) {
@@ -139,93 +143,183 @@ fn render_sidebar(app: &App, area: Rect, buf: &mut Buffer) {
         _ => "database",
     };
 
-    let viewing_table = match &app.current_view {
-        CurrentView::TableView(state) => Some(state.table_name.as_str()),
-        _ => None,
-    };
+    let title = format!(" {} ", db_name);
+    let block = pane_block(&title, app.focused_pane == FocusedPane::Sidebar);
+    let inner = block.inner(area);
+    block.render(area, buf);
 
-    let is_focused = app.focused_pane == FocusedPane::Sidebar;
-    let border_color = if is_focused { BORDER_FOCUSED } else { BORDER_NORMAL };
+    let layout = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
+    let (lines, selected_idx) = build_tree_lines(app);
 
-    let sidebar_block = Block::bordered()
-        .title(format!(" {} ", db_name))
-        .title_style(Style::default().fg(TITLE_COLOR).add_modifier(Modifier::BOLD))
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(border_color));
-
-    let sidebar_inner = sidebar_block.inner(area);
-    sidebar_block.render(area, buf);
-
-    let layout = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(sidebar_inner);
-    let list_area = layout[0];
-    let footer_area = layout[1];
-
-    if app.tables.is_empty() {
+    if lines.is_empty() {
         let centered = Layout::vertical([Constraint::Fill(1), Constraint::Length(1), Constraint::Fill(1)])
-            .split(list_area);
-        Paragraph::new(Span::styled("<empty>", Style::default().fg(TEXT_DIM).italic()))
+            .split(layout[0]);
+        Paragraph::new(Span::styled("Loading...", Style::default().fg(TEXT_DIM).italic()))
             .alignment(Alignment::Center)
             .render(centered[1], buf);
     } else {
-        let visible_rows = list_area.height as usize;
-        let scroll_offset = app.sidebar_scroll_offset.min(app.tables.len().saturating_sub(visible_rows));
-        let end_idx = (scroll_offset + visible_rows).min(app.tables.len());
+        let visible_height = layout[0].height as usize;
+        let scroll_offset = selected_idx.map_or(0, |idx| {
+            if idx < visible_height / 2 {
+                0
+            } else if idx >= lines.len().saturating_sub(visible_height / 2) {
+                lines.len().saturating_sub(visible_height)
+            } else {
+                idx.saturating_sub(visible_height / 2)
+            }
+        });
 
-        let items: Vec<ListItem> = app.tables.iter().enumerate()
+        let visible_lines: Vec<Line> = lines
+            .into_iter()
             .skip(scroll_offset)
-            .take(end_idx - scroll_offset)
-            .map(|(i, table)| {
-                let is_selected = i == app.selected_table_index;
-                let is_viewing = viewing_table == Some(table.as_str());
-                let prefix = if is_selected { "▸ " } else { "  " };
-
-                let (fg, bg, modifier) = if is_selected {
-                    (SELECTED_FG, SELECTED_BG, Modifier::BOLD)
-                } else if is_viewing {
-                    (TEXT_SUCCESS, Color::Reset, Modifier::BOLD)
-                } else {
-                    (TEXT_NORMAL, Color::Reset, Modifier::empty())
-                };
-
-                let style = Style::default().fg(fg).bg(bg).add_modifier(modifier);
-                ListItem::new(Line::from(vec![
-                    Span::styled(prefix, style),
-                    Span::styled(format!("󰓫 {}", table), style),
-                ]))
-            })
+            .take(visible_height)
             .collect();
-
-        let list = List::new(items);
-        let mut state = ListState::default();
-        if app.selected_table_index >= scroll_offset && app.selected_table_index < end_idx {
-            state.select(Some(app.selected_table_index - scroll_offset));
-        }
-        ratatui::widgets::StatefulWidget::render(list, list_area, buf, &mut state);
+        Paragraph::new(visible_lines).render(layout[0], buf);
     }
 
-    let scroll_info = if app.tables.is_empty() {
-        "0 tables".to_string()
-    } else if app.tables.len() > list_area.height as usize {
-        format!("{}/{} tables", app.selected_table_index + 1, app.tables.len())
-    } else {
-        format!("{} tables", app.tables.len())
+    let table_count: usize = app.db_structure.as_ref().map_or(0, |s| s.schemas.iter().map(|sc| sc.tables.len()).sum());
+    Paragraph::new(Span::styled(
+        format!("{} tables │ r refresh │ ←→ expand", table_count),
+        Style::default().fg(TEXT_DIM),
+    ))
+    .alignment(Alignment::Center)
+    .render(layout[1], buf);
+}
+
+fn build_tree_lines(app: &App) -> (Vec<Line<'static>>, Option<usize>) {
+    let Some(structure) = &app.db_structure else {
+        return (vec![], None);
     };
 
-    Paragraph::new(Span::styled(scroll_info, Style::default().fg(TEXT_DIM)))
-        .alignment(Alignment::Center)
-        .render(footer_area, buf);
+    let selected = app.tree_state.selected();
+    let opened = app.tree_state.opened();
+    let selected_table = app.selected_table.as_ref();
+
+    let db_name = match &app.connection {
+        ConnectionState::Connected { db_name, .. } => db_name.clone(),
+        _ => "database".to_string(),
+    };
+
+    let mut lines = Vec::new();
+    let mut selected_idx = None;
+
+    let root_path = vec![TreeNodeId::Root];
+    let root_expanded = opened.iter().any(|p| p == &root_path);
+    if selected == root_path {
+        selected_idx = Some(lines.len());
+    }
+    lines.push(tree_line(0, root_expanded, true, selected == root_path, vec![
+        Span::styled("󰆼 ", Style::default().fg(TEXT_SUCCESS)),
+        Span::styled(db_name, Style::default().fg(TEXT_NORMAL).bold()),
+    ]));
+
+    if !root_expanded {
+        return (lines, selected_idx);
+    }
+
+    for schema in &structure.schemas {
+        let schema_path = vec![TreeNodeId::Root, TreeNodeId::Schema(schema.name.clone())];
+        let schema_expanded = opened.iter().any(|p| p == &schema_path);
+        let is_selected = selected == schema_path;
+        if is_selected {
+            selected_idx = Some(lines.len());
+        }
+
+        let icon = if schema.name == "public" { "󰉖 " } else { "󰉋 " };
+        lines.push(tree_line(1, schema_expanded, !schema.tables.is_empty(), is_selected, vec![
+            Span::styled(icon, Style::default().fg(ICON_GRAY)),
+            Span::styled(schema.name.clone(), Style::default().fg(TEXT_NORMAL)),
+            Span::styled(format!(" ({})", schema.tables.len()), Style::default().fg(TEXT_DIM)),
+        ]));
+
+        if !schema_expanded {
+            continue;
+        }
+
+        for table in &schema.tables {
+            let table_path = vec![
+                TreeNodeId::Root,
+                TreeNodeId::Schema(schema.name.clone()),
+                TreeNodeId::Table { schema: schema.name.clone(), table: table.name.clone() },
+            ];
+            let table_expanded = opened.iter().any(|p| p == &table_path);
+            let is_selected = selected == table_path;
+            if is_selected {
+                selected_idx = Some(lines.len());
+            }
+
+            let is_viewing = selected_table.is_some_and(|(s, t)| s == &schema.name && t == &table.name);
+            let style = if is_viewing {
+                Style::default().fg(TEXT_SUCCESS).bold()
+    } else {
+                Style::default().fg(TEXT_NORMAL)
+            };
+
+            lines.push(tree_line(2, table_expanded, !table.columns.is_empty(), is_selected, vec![
+                Span::styled("󰓫 ", style),
+                Span::styled(table.name.clone(), style),
+            ]));
+
+            if !table_expanded {
+                continue;
+            }
+
+            for col in &table.columns {
+                let col_path = vec![
+                    TreeNodeId::Root,
+                    TreeNodeId::Schema(schema.name.clone()),
+                    TreeNodeId::Table { schema: schema.name.clone(), table: table.name.clone() },
+                    TreeNodeId::Column { schema: schema.name.clone(), table: table.name.clone(), column: col.name.clone() },
+                ];
+                let is_selected = selected == col_path;
+                if is_selected {
+                    selected_idx = Some(lines.len());
+                }
+
+                let icon = if col.is_primary_key {
+                    Span::styled("󰌋 ", Style::default().fg(PK_COLOR))
+                } else if col.is_nullable {
+                    Span::styled("○ ", Style::default().fg(TEXT_DIM))
+                } else {
+                    Span::styled("• ", Style::default().fg(TEXT_NORMAL))
+                };
+
+                lines.push(tree_line(3, false, false, is_selected, vec![
+                    icon,
+                    Span::styled(col.name.clone(), Style::default().fg(TEXT_NORMAL)),
+                    Span::raw(" "),
+                    Span::styled(col.data_type.clone(), Style::default().fg(TEXT_DIM)),
+                ]));
+            }
+        }
+    }
+
+    (lines, selected_idx)
+}
+
+fn tree_line(depth: usize, expanded: bool, has_children: bool, selected: bool, content: Vec<Span<'static>>) -> Line<'static> {
+    let arrow = match (has_children, expanded) {
+        (true, true) => "▾ ",
+        (true, false) => "▸ ",
+        (false, _) => "  ",
+    };
+
+    let mut spans = vec![
+        Span::raw("  ".repeat(depth)),
+        Span::styled(arrow, Style::default().fg(TEXT_DIM)),
+    ];
+    spans.extend(content);
+
+    let line = Line::from(spans);
+    if selected {
+        line.style(Style::default().fg(SELECTED_FG).bg(SELECTED_BG))
+    } else {
+        line
+    }
 }
 
 fn render_stats_panel(app: &App, area: Rect, buf: &mut Buffer) {
-    let is_focused = app.focused_pane == FocusedPane::Stats;
-    let border_color = if is_focused { BORDER_FOCUSED } else { BORDER_NORMAL };
-
-    let block = Block::bordered()
-        .title(" ◉ Live Monitor ")
-        .title_style(Style::default().fg(TITLE_COLOR).add_modifier(Modifier::BOLD))
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(border_color));
-
+    let block = pane_block(" ◉ Live Monitor ", app.focused_pane == FocusedPane::Stats);
     let inner = block.inner(area);
     block.render(area, buf);
 
@@ -239,55 +333,45 @@ fn render_ascii_graphs(app: &App, area: Rect, buf: &mut Buffer) {
     let top_cols = Layout::horizontal([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)]).split(rows[0]);
     let bottom_cols = Layout::horizontal([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)]).split(rows[1]);
 
-    let qps_color = make_color_fn(50, true);
-    let rows_color = make_color_fn(10000, true);
-    let latency_color_fn = make_color_fn(300, false);
-    let conn_color = make_color_fn(20, true);
-
-    render_ascii_graph_cell("qps", &app.stats.queries_per_sec, &qps_color, top_cols[0], buf);
-    render_ascii_graph_cell("rows", &app.stats.rows_per_sec, &rows_color, top_cols[1], buf);
-    render_ascii_graph_cell("ms", &app.stats.latency_ms, &latency_color_fn, bottom_cols[0], buf);
-    render_ascii_graph_cell("conn", &app.stats.connections, &conn_color, bottom_cols[1], buf);
+    render_graph("qps", &app.stats.queries_per_sec, &make_color_fn(50, true), top_cols[0], buf);
+    render_graph("rows", &app.stats.rows_per_sec, &make_color_fn(10000, true), top_cols[1], buf);
+    render_graph("ms", &app.stats.latency_ms, &make_color_fn(300, false), bottom_cols[0], buf);
+    render_graph("conn", &app.stats.connections, &make_color_fn(20, true), bottom_cols[1], buf);
 }
 
-fn render_ascii_graph_cell<F>(
+fn render_graph<F: Fn(u64, u64) -> Color>(
     label: &str,
     data: &std::collections::VecDeque<u64>,
     color_fn: &F,
     area: Rect,
     buf: &mut Buffer,
-) where
-    F: Fn(u64, u64) -> Color,
-{
+) {
     if area.height == 0 || area.width == 0 {
         return;
     }
 
     let layout = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(area);
-    let current_value = data.back().copied().unwrap_or(0);
-    let observed_max = data.iter().max().copied().unwrap_or(1).max(1);
+    let current = data.back().copied().unwrap_or(0);
+    let max = data.iter().max().copied().unwrap_or(1).max(1);
 
-    let header_line = Line::from(vec![
+    Paragraph::new(Line::from(vec![
         Span::styled(format!(" {} ", label), Style::default().fg(TEXT_DIM)),
-        Span::styled(
-            format!("{:>4}", current_value),
-            Style::default().fg(color_fn(current_value, observed_max)).add_modifier(Modifier::BOLD),
-        ),
-    ]);
-    Paragraph::new(header_line).render(layout[0], buf);
+        Span::styled(format!("{:>4}", current), Style::default().fg(color_fn(current, max)).bold()),
+    ]))
+    .render(layout[0], buf);
 
-    AsciiDotGraph::new(data, observed_max, color_fn)
+    AsciiDotGraph::new(data, max, color_fn)
         .height(layout[1].height.max(1))
         .render(layout[1], buf);
 }
 
 fn render_stats_info(app: &App, area: Rect, buf: &mut Buffer) {
-    let lines = vec![
+    Paragraph::new(vec![
         Line::from(vec![
             Span::styled("● ", Style::default().fg(TEXT_SUCCESS)),
             Span::styled(&app.stats.host, Style::default().fg(TEXT_NORMAL)),
             Span::styled(" │ ", Style::default().fg(SEPARATOR)),
-            Span::styled(&app.stats.database, Style::default().fg(TEXT_NORMAL).add_modifier(Modifier::BOLD)),
+            Span::styled(&app.stats.database, Style::default().fg(TEXT_NORMAL).bold()),
         ]),
         Line::from(vec![
             Span::styled("Tables: ", Style::default().fg(TEXT_DIM)),
@@ -295,7 +379,7 @@ fn render_stats_info(app: &App, area: Rect, buf: &mut Buffer) {
             Span::styled(" │ ", Style::default().fg(SEPARATOR)),
             Span::styled("Last: ", Style::default().fg(TEXT_DIM)),
             Span::styled(
-                app.stats.last_query_ms.map_or("—".to_string(), |ms| format!("{}ms", ms)),
+                app.stats.last_query_ms.map_or("—".into(), |ms| format!("{}ms", ms)),
                 latency_style(app.stats.last_query_ms.unwrap_or(0) as u64),
             ),
             Span::styled(" │ ", Style::default().fg(SEPARATOR)),
@@ -306,41 +390,32 @@ fn render_stats_info(app: &App, area: Rect, buf: &mut Buffer) {
             if app.stats.pg_version.is_empty() { "PostgreSQL" } else { &app.stats.pg_version },
             Style::default().fg(TEXT_DIM).italic(),
         )),
-    ];
-    Paragraph::new(lines).render(area, buf);
+    ])
+    .render(area, buf);
 }
 
 fn render_logs_panel(app: &App, area: Rect, buf: &mut Buffer) {
-    let is_focused = app.focused_pane == FocusedPane::Logs;
-    let border_color = if is_focused { BORDER_FOCUSED } else { BORDER_NORMAL };
-
-    let block = Block::bordered()
-        .title(" 󰌱 DB Logs ")
-        .title_style(Style::default().fg(TITLE_COLOR).add_modifier(Modifier::BOLD))
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(border_color));
-
+    let block = pane_block(" 󰌱 DB Logs ", app.focused_pane == FocusedPane::Logs);
     let inner = block.inner(area);
     block.render(area, buf);
 
-    let logs_widget = TuiLoggerSmartWidget::default()
+    TuiLoggerSmartWidget::default()
         .style_error(Style::default().fg(TEXT_ERROR))
-        .style_warn(Style::default().fg(Color::Rgb(255, 165, 0))) // Orange for warnings
+        .style_warn(Style::default().fg(BORDER_FOCUSED))
         .style_info(Style::default().fg(TEXT_NORMAL))
         .style_debug(Style::default().fg(TEXT_SUCCESS))
         .style_trace(Style::default().fg(TEXT_DIM))
-        .state(&app.logs_state);
-
-    logs_widget.render(inner, buf);
+        .state(&app.logs_state)
+        .render(inner, buf);
 }
 
 fn latency_style(ms: u64) -> Style {
     Style::default().fg(match ms {
         0 => TEXT_DIM,
-        1..100 => Color::Rgb(80, 255, 80),   // Green
-        100..200 => Color::Rgb(255, 255, 0), // Yellow
-        200..300 => Color::Rgb(255, 165, 0), // Orange
-        _ => Color::Rgb(255, 80, 80),        // Red
+        1..100 => Color::Rgb(80, 255, 80),
+        100..200 => Color::Rgb(255, 255, 0),
+        200..300 => Color::Rgb(255, 165, 0),
+        _ => Color::Rgb(255, 80, 80),
     })
 }
 
@@ -358,17 +433,9 @@ fn render_content_area(app: &App, area: Rect, buf: &mut Buffer) {
 }
 
 fn render_placeholder(app: &App, area: Rect, buf: &mut Buffer) {
-    let is_focused = app.focused_pane == FocusedPane::Results;
-    let border_color = if is_focused { BORDER_FOCUSED } else { BORDER_NORMAL };
-
-    let content_block = Block::bordered()
-        .title(" Results ")
-        .title_style(Style::default().fg(TITLE_COLOR).add_modifier(Modifier::BOLD))
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(border_color));
-
-    let content_inner = content_block.inner(area);
-    content_block.render(area, buf);
+    let block = pane_block(" Results ", app.focused_pane == FocusedPane::Results);
+    let inner = block.inner(area);
+    block.render(area, buf);
 
     let centered = Layout::vertical([
         Constraint::Fill(1),
@@ -376,7 +443,7 @@ fn render_placeholder(app: &App, area: Rect, buf: &mut Buffer) {
         Constraint::Length(2),
         Constraint::Fill(1),
     ])
-    .split(content_inner);
+    .split(inner);
 
     Paragraph::new(Line::from(vec![
         Span::styled("Select a table ", Style::default().fg(TEXT_DIM)),
@@ -395,24 +462,17 @@ fn render_placeholder(app: &App, area: Rect, buf: &mut Buffer) {
         Span::styled("q", Style::default().fg(TEXT_NORMAL)),
         Span::styled(" quit", Style::default().fg(TEXT_DIM)),
     ]))
-    .alignment(Alignment::Center)
+        .alignment(Alignment::Center)
     .render(centered[2], buf);
 }
 
 fn render_table_view(state: &TableViewState, app: &App, area: Rect, buf: &mut Buffer) {
-    let is_focused = app.focused_pane == FocusedPane::Results;
-    let border_color = if is_focused { BORDER_FOCUSED } else { BORDER_NORMAL };
+    let title = format!(" {} ", state.table_name);
+    let block = pane_block(&title, app.focused_pane == FocusedPane::Results);
+    let inner = block.inner(area);
+    block.render(area, buf);
 
-    let content_block = Block::bordered()
-        .title(format!(" {} ", state.table_name))
-        .title_style(Style::default().fg(TITLE_COLOR).add_modifier(Modifier::BOLD))
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(border_color));
-
-    let content_inner = content_block.inner(area);
-    content_block.render(area, buf);
-
-    let layout = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(content_inner);
+    let layout = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(inner);
 
     if state.loading {
         render_centered_message(layout[0], buf, "⟳ ", "Loading...", TEXT_NORMAL);
@@ -428,20 +488,12 @@ fn render_table_view(state: &TableViewState, app: &App, area: Rect, buf: &mut Bu
 }
 
 fn render_query_results(qr: &QueryResultState, app: &App, area: Rect, buf: &mut Buffer) {
-    let is_focused = app.focused_pane == FocusedPane::Results;
-    let border_color = if is_focused { BORDER_FOCUSED } else { BORDER_NORMAL };
     let title = if qr.error.is_some() { " Query Error " } else { " Query Results " };
+    let block = pane_block(title, app.focused_pane == FocusedPane::Results);
+    let inner = block.inner(area);
+    block.render(area, buf);
 
-    let content_block = Block::bordered()
-        .title(title)
-        .title_style(Style::default().fg(TITLE_COLOR).add_modifier(Modifier::BOLD))
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(border_color));
-
-    let content_inner = content_block.inner(area);
-    content_block.render(area, buf);
-
-    let layout = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(content_inner);
+    let layout = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(inner);
 
     if let Some(error) = &qr.error {
         Paragraph::new(error.clone())
@@ -471,7 +523,7 @@ fn render_query_results(qr: &QueryResultState, app: &App, area: Rect, buf: &mut 
         Span::styled("c", Style::default().fg(TEXT_NORMAL)),
         Span::styled(" clear", Style::default().fg(TEXT_DIM)),
     ]))
-    .alignment(Alignment::Center)
+        .alignment(Alignment::Center)
     .render(layout[1], buf);
 }
 
@@ -481,18 +533,11 @@ fn render_centered_message(area: Rect, buf: &mut Buffer, prefix: &str, msg: &str
         Span::styled(prefix, Style::default().fg(color)),
         Span::styled(msg, Style::default().fg(color)),
     ]))
-    .alignment(Alignment::Center)
-    .render(centered[1], buf);
+        .alignment(Alignment::Center)
+        .render(centered[1], buf);
 }
 
-fn render_data_table(
-    columns: &[String],
-    rows: &[Vec<String>],
-    selected_row: usize,
-    scroll_offset: usize,
-    area: Rect,
-    buf: &mut Buffer,
-) {
+fn render_data_table(columns: &[String], rows: &[Vec<String>], selected_row: usize, scroll_offset: usize, area: Rect, buf: &mut Buffer) {
     if columns.is_empty() {
         return;
     }
@@ -507,13 +552,7 @@ fn render_data_table(
     }
 
     let constraints: Vec<Constraint> = col_widths.iter().map(|&w| Constraint::Length((w + 2) as u16)).collect();
-
-    let header = Row::new(
-        columns.iter().map(|col| {
-            Cell::from(col.clone()).style(Style::default().fg(TEXT_NORMAL).add_modifier(Modifier::BOLD))
-        }),
-    )
-    .height(1);
+    let header = Row::new(columns.iter().map(|col| Cell::from(col.clone()).style(Style::default().fg(TEXT_NORMAL).bold()))).height(1);
 
     let visible_rows = area.height.saturating_sub(1) as usize;
     let end_idx = (scroll_offset + visible_rows).min(rows.len());
@@ -522,8 +561,12 @@ fn render_data_table(
         .iter()
         .enumerate()
         .map(|(visible_idx, row)| {
-            let actual_idx = scroll_offset + visible_idx;
-            let is_selected = actual_idx == selected_row;
+            let is_selected = scroll_offset + visible_idx == selected_row;
+            let row_style = if is_selected {
+                Style::default().bg(SELECTED_BG).fg(SELECTED_FG)
+                    } else {
+                Style::default()
+            };
 
             let cells: Vec<Cell> = row.iter().map(|cell| {
                 let display = if cell.len() > 30 { format!("{}…", &cell[..29]) } else { cell.clone() };
@@ -531,24 +574,17 @@ fn render_data_table(
                     Style::default().fg(SELECTED_FG).bg(SELECTED_BG)
                 } else if cell == "NULL" {
                     Style::default().fg(TEXT_DIM).italic()
-                } else {
+                    } else {
                     Style::default().fg(TEXT_NORMAL)
-                };
-                Cell::from(display).style(style)
+                    };
+                    Cell::from(display).style(style)
             }).collect();
 
-            let row_style = if is_selected {
-                Style::default().bg(SELECTED_BG).fg(SELECTED_FG)
-            } else {
-                Style::default()
-            };
             Row::new(cells).style(row_style).height(1)
         })
         .collect();
 
-    Table::new(data_rows, constraints)
-        .header(header)
-        .render(area, buf);
+    Table::new(data_rows, constraints).header(header).render(area, buf);
 }
 
 fn render_table_footer(state: &TableViewState, area: Rect, buf: &mut Buffer) {
@@ -565,13 +601,12 @@ fn render_table_footer(state: &TableViewState, area: Rect, buf: &mut Buffer) {
         Span::styled("↑↓", Style::default().fg(TEXT_NORMAL)),
         Span::styled(" row", Style::default().fg(TEXT_DIM)),
     ]))
-    .alignment(Alignment::Center)
-    .render(area, buf);
+        .alignment(Alignment::Center)
+        .render(area, buf);
 }
 
 fn render_sql_editor(app: &App, area: Rect, buf: &mut Buffer) {
     let is_focused = app.focused_pane == FocusedPane::Editor;
-    let border_color = if is_focused { BORDER_FOCUSED } else { BORDER_NORMAL };
 
     let title = if app.query_executing {
         format!(" SQL ⟳ {}ms ", app.query_elapsed_ms().unwrap_or(0))
@@ -583,20 +618,15 @@ fn render_sql_editor(app: &App, area: Rect, buf: &mut Buffer) {
 
     let block = Block::bordered()
         .title(title)
-        .title_style(if is_focused {
-            Style::default().fg(BORDER_FOCUSED).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(TEXT_DIM)
-        })
+        .title_style(if is_focused { Style::default().fg(BORDER_FOCUSED).bold() } else { Style::default().fg(TEXT_DIM) })
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(border_color));
+        .border_style(border_style(is_focused));
 
     let inner = block.inner(area);
     block.render(area, buf);
 
     let layout = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
     let editor_area = layout[0];
-    let footer_area = layout[1];
 
     let lines = app.sql_editor.lines();
     let cursor = app.sql_editor.cursor();
@@ -609,10 +639,10 @@ fn render_sql_editor(app: &App, area: Rect, buf: &mut Buffer) {
         .take(end_idx - scroll_offset)
         .map(|(line_idx, line)| {
             if line.is_empty() && !is_focused && line_idx == 0 && lines.len() == 1 {
-                return Line::from(Span::styled(
-                    "-- type : to focus · F5 or Shift+Enter to run",
+                    return Line::from(Span::styled(
+                        "-- type : to focus · F5 or Shift+Enter to run",
                     Style::default().fg(TEXT_DIM).italic(),
-                ));
+                    ));
             }
             highlight_sql_line(line, line_idx, cursor, is_focused)
         })
@@ -621,10 +651,8 @@ fn render_sql_editor(app: &App, area: Rect, buf: &mut Buffer) {
     Paragraph::new(highlighted_lines).render(editor_area, buf);
 
     if is_focused && cursor.0 >= scroll_offset && cursor.0 < end_idx {
-        let visible_row = cursor.0 - scroll_offset;
-        let cursor_y = editor_area.y + visible_row as u16;
+        let cursor_y = editor_area.y + (cursor.0 - scroll_offset) as u16;
         let cursor_x = editor_area.x + cursor.1 as u16;
-
         if cursor_y < editor_area.y + editor_area.height
             && cursor_x < editor_area.x + editor_area.width
             && let Some(cell) = buf.cell_mut((cursor_x, cursor_y))
@@ -645,7 +673,7 @@ fn render_sql_editor(app: &App, area: Rect, buf: &mut Buffer) {
                 if y == thumb_pos {
                     cell.set_char('█');
                     cell.set_style(Style::default().fg(Color::Rgb(120, 120, 120)));
-                } else {
+    } else {
                     cell.set_char('│');
                     cell.set_style(Style::default().fg(Color::Rgb(60, 60, 60)));
                 }
@@ -655,7 +683,7 @@ fn render_sql_editor(app: &App, area: Rect, buf: &mut Buffer) {
 
     let footer = if app.query_executing {
         Line::from(vec![
-            Span::styled("⟳ Running", Style::default().fg(BORDER_FOCUSED).add_modifier(Modifier::BOLD)),
+            Span::styled("⟳ Running", Style::default().fg(BORDER_FOCUSED).bold()),
             Span::styled(format!(" {}ms...", app.query_elapsed_ms().unwrap_or(0)), Style::default().fg(BORDER_FOCUSED)),
         ])
     } else {
@@ -676,7 +704,7 @@ fn render_sql_editor(app: &App, area: Rect, buf: &mut Buffer) {
         Line::from(spans)
     };
 
-    Paragraph::new(footer).alignment(Alignment::Center).render(footer_area, buf);
+    Paragraph::new(footer).alignment(Alignment::Center).render(layout[1], buf);
 }
 
 fn highlight_sql_line(line: &str, line_idx: usize, cursor: (usize, usize), is_focused: bool) -> Line<'static> {
@@ -686,7 +714,6 @@ fn highlight_sql_line(line: &str, line_idx: usize, cursor: (usize, usize), is_fo
     let mut i = 0;
 
     while i < chars.len() {
-        // String literals
         if chars[i] == '\'' {
             let start = i;
             i += 1;
@@ -696,37 +723,24 @@ fn highlight_sql_line(line: &str, line_idx: usize, cursor: (usize, usize), is_fo
             if i < chars.len() {
                 i += 1;
             }
-            spans.push(Span::styled(
-                chars[start..i].iter().collect::<String>(),
-                Style::default().fg(TEXT_SUCCESS),
-            ));
+            spans.push(Span::styled(chars[start..i].iter().collect::<String>(), Style::default().fg(TEXT_SUCCESS)));
             continue;
         }
 
-        // Comments
         if i + 1 < chars.len() && chars[i] == '-' && chars[i + 1] == '-' {
-            spans.push(Span::styled(
-                chars[i..].iter().collect::<String>(),
-                Style::default().fg(TEXT_DIM).italic(),
-            ));
+            spans.push(Span::styled(chars[i..].iter().collect::<String>(), Style::default().fg(TEXT_DIM).italic()));
             break;
         }
 
-        // Keywords
         let remaining: String = chars[i..].iter().collect();
         let mut found_keyword = false;
-
         for &keyword in SQL_KEYWORDS {
             if remaining.to_uppercase().starts_with(keyword) {
                 let next_idx = i + keyword.len();
                 let is_word_boundary = next_idx >= chars.len() || (!chars[next_idx].is_alphanumeric() && chars[next_idx] != '_');
                 let is_start_boundary = i == 0 || (!chars[i - 1].is_alphanumeric() && chars[i - 1] != '_');
-
                 if is_word_boundary && is_start_boundary {
-                    spans.push(Span::styled(
-                        chars[i..next_idx].iter().collect::<String>(),
-                        Style::default().fg(TEXT_NORMAL).add_modifier(Modifier::BOLD),
-                    ));
+                    spans.push(Span::styled(chars[i..next_idx].iter().collect::<String>(), Style::default().fg(TEXT_NORMAL).bold()));
                     i = next_idx;
                     found_keyword = true;
                     break;
@@ -737,28 +751,19 @@ fn highlight_sql_line(line: &str, line_idx: usize, cursor: (usize, usize), is_fo
             continue;
         }
 
-        // Numbers
         if chars[i].is_ascii_digit() {
             let start = i;
             while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.') {
                 i += 1;
             }
-            spans.push(Span::styled(
-                chars[start..i].iter().collect::<String>(),
-                Style::default().fg(Color::Rgb(255, 180, 100)), // Warm orange for numbers
-            ));
+            spans.push(Span::styled(chars[start..i].iter().collect::<String>(), Style::default().fg(NUMBER_COLOR)));
             continue;
         }
 
-        // Default text
         spans.push(Span::styled(chars[i].to_string(), Style::default().fg(TEXT_NORMAL)));
         i += 1;
     }
 
-    let line_style = if is_cursor_line {
-        Style::default().bg(Color::Rgb(40, 40, 40))
-    } else {
-        Style::default()
-    };
+    let line_style = if is_cursor_line { Style::default().bg(CURSOR_LINE_BG) } else { Style::default() };
     Line::from(spans).style(line_style)
 }
