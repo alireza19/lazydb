@@ -10,6 +10,18 @@ use tui_logger::TuiLoggerSmartWidget;
 use crate::app::{App, ConnectionState, CurrentView, FocusedPane, QueryResultState, TableViewState};
 use crate::dotline::{make_color_fn, AsciiDotGraph};
 
+// Theme colors
+const BORDER_NORMAL: Color = Color::White;
+const BORDER_FOCUSED: Color = Color::Rgb(255, 140, 0); // Bright orange
+const TITLE_COLOR: Color = Color::White;
+const TEXT_NORMAL: Color = Color::White;
+const TEXT_DIM: Color = Color::DarkGray;
+const TEXT_SUCCESS: Color = Color::Green;
+const TEXT_ERROR: Color = Color::Red;
+const SELECTED_BG: Color = Color::Rgb(255, 140, 0); // Orange
+const SELECTED_FG: Color = Color::Black;
+const SEPARATOR: Color = Color::Rgb(80, 80, 80);
+
 const SQL_KEYWORDS: &[&str] = &[
     "SELECT", "FROM", "WHERE", "AND", "OR", "NOT", "IN", "LIKE", "BETWEEN", "IS", "NULL",
     "ORDER", "BY", "ASC", "DESC", "LIMIT", "OFFSET", "GROUP", "HAVING", "JOIN", "LEFT",
@@ -34,8 +46,9 @@ fn render_connection_status(app: &App, area: Rect, buf: &mut Buffer) {
     let block = Block::bordered()
         .title(" lazydb ")
         .title_alignment(Alignment::Center)
+        .title_style(Style::default().fg(TITLE_COLOR).add_modifier(Modifier::BOLD))
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_style(Style::default().fg(BORDER_NORMAL));
 
     let inner = block.inner(area);
     block.render(area, buf);
@@ -50,25 +63,25 @@ fn render_connection_status(app: &App, area: Rect, buf: &mut Buffer) {
 
     let status_line = match &app.connection {
         ConnectionState::Connecting => Line::from(vec![
-            Span::styled("⟳ ", Style::default().fg(Color::Yellow)),
-            Span::styled("Connecting...", Style::default().fg(Color::Yellow)),
+            Span::styled("⟳ ", Style::default().fg(TEXT_NORMAL)),
+            Span::styled("Connecting...", Style::default().fg(TEXT_NORMAL)),
         ]),
         ConnectionState::Connected { db_name, .. } => Line::from(vec![
-            Span::styled("● ", Style::default().fg(Color::Green)),
-            Span::styled(format!("Connected to {db_name}"), Style::default().fg(Color::Green)),
+            Span::styled("● ", Style::default().fg(TEXT_SUCCESS)),
+            Span::styled(format!("Connected to {db_name}"), Style::default().fg(TEXT_SUCCESS)),
         ]),
         ConnectionState::Failed { error } => Line::from(vec![
-            Span::styled("✗ ", Style::default().fg(Color::Red)),
-            Span::styled(format!("Connection failed: {error}"), Style::default().fg(Color::Red)),
+            Span::styled("✗ ", Style::default().fg(TEXT_ERROR)),
+            Span::styled(format!("Connection failed: {error}"), Style::default().fg(TEXT_ERROR)),
         ]),
     };
 
     Paragraph::new(status_line).alignment(Alignment::Center).render(layout[1], buf);
 
     let help_line = Line::from(vec![
-        Span::styled("Press ", Style::default().fg(Color::DarkGray)),
-        Span::styled("q", Style::default().fg(Color::White).bold()),
-        Span::styled(" to quit", Style::default().fg(Color::DarkGray)),
+        Span::styled("Press ", Style::default().fg(TEXT_DIM)),
+        Span::styled("q", Style::default().fg(TEXT_NORMAL).add_modifier(Modifier::BOLD)),
+        Span::styled(" to quit", Style::default().fg(TEXT_DIM)),
     ]);
 
     Paragraph::new(help_line).alignment(Alignment::Center).render(layout[2], buf);
@@ -78,28 +91,20 @@ fn render_main_layout(app: &App, area: Rect, buf: &mut Buffer) {
     let main_block = Block::bordered()
         .title(" lazydb ")
         .title_alignment(Alignment::Center)
+        .title_style(Style::default().fg(TITLE_COLOR).add_modifier(Modifier::BOLD))
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_style(Style::default().fg(BORDER_NORMAL));
 
     let inner = main_block.inner(area);
     main_block.render(area, buf);
 
-    // Outer: content + status bar
     let outer = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
-
-    // Main area: 70% top, 30% bottom (for logs)
     let main_vertical = Layout::vertical([Constraint::Percentage(70), Constraint::Percentage(30)])
         .split(outer[0]);
-
-    // Top area: 30% left sidebar + 70% right content
     let top_horizontal = Layout::horizontal([Constraint::Percentage(30), Constraint::Percentage(70)])
         .split(main_vertical[0]);
-
-    // Right content: 70% results + 30% SQL editor
     let right_stack = Layout::vertical([Constraint::Percentage(70), Constraint::Percentage(30)])
         .split(top_horizontal[1]);
-
-    // Bottom area: 30% live monitor + 70% logs
     let bottom_horizontal = Layout::horizontal([Constraint::Percentage(30), Constraint::Percentage(70)])
         .split(main_vertical[1]);
 
@@ -113,14 +118,17 @@ fn render_main_layout(app: &App, area: Rect, buf: &mut Buffer) {
 
 fn render_global_status_bar(app: &App, area: Rect, buf: &mut Buffer) {
     let status = Line::from(vec![
-        Span::styled(format!("[{}]", app.focused_pane.label()), Style::default().fg(Color::Yellow).bold()),
-        Span::styled(" │ ", Style::default().fg(Color::Rgb(60, 60, 60))),
-        Span::styled("Tab", Style::default().fg(Color::Cyan)),
-        Span::styled(" cycle  ", Style::default().fg(Color::DarkGray)),
-        Span::styled(":", Style::default().fg(Color::Cyan)),
-        Span::styled(" SQL  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("q", Style::default().fg(Color::Cyan)),
-        Span::styled(" quit", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("[{}]", app.focused_pane.label()),
+            Style::default().fg(BORDER_FOCUSED).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" │ ", Style::default().fg(SEPARATOR)),
+        Span::styled("Tab", Style::default().fg(TEXT_NORMAL)),
+        Span::styled(" cycle  ", Style::default().fg(TEXT_DIM)),
+        Span::styled(":", Style::default().fg(TEXT_NORMAL)),
+        Span::styled(" SQL  ", Style::default().fg(TEXT_DIM)),
+        Span::styled("q", Style::default().fg(TEXT_NORMAL)),
+        Span::styled(" quit", Style::default().fg(TEXT_DIM)),
     ]);
     Paragraph::new(status).alignment(Alignment::Center).render(area, buf);
 }
@@ -137,11 +145,11 @@ fn render_sidebar(app: &App, area: Rect, buf: &mut Buffer) {
     };
 
     let is_focused = app.focused_pane == FocusedPane::Sidebar;
-    let border_color = if is_focused { Color::Yellow } else { Color::Rgb(60, 60, 60) };
+    let border_color = if is_focused { BORDER_FOCUSED } else { BORDER_NORMAL };
 
     let sidebar_block = Block::bordered()
         .title(format!(" {} ", db_name))
-        .title_style(Style::default().fg(Color::Cyan).bold())
+        .title_style(Style::default().fg(TITLE_COLOR).add_modifier(Modifier::BOLD))
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(border_color));
 
@@ -155,7 +163,7 @@ fn render_sidebar(app: &App, area: Rect, buf: &mut Buffer) {
     if app.tables.is_empty() {
         let centered = Layout::vertical([Constraint::Fill(1), Constraint::Length(1), Constraint::Fill(1)])
             .split(list_area);
-        Paragraph::new(Span::styled("<empty>", Style::default().fg(Color::DarkGray).italic()))
+        Paragraph::new(Span::styled("<empty>", Style::default().fg(TEXT_DIM).italic()))
             .alignment(Alignment::Center)
             .render(centered[1], buf);
     } else {
@@ -170,13 +178,16 @@ fn render_sidebar(app: &App, area: Rect, buf: &mut Buffer) {
                 let is_selected = i == app.selected_table_index;
                 let is_viewing = viewing_table == Some(table.as_str());
                 let prefix = if is_selected { "▸ " } else { "  " };
-                let style = if is_viewing {
-                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
-                } else if is_selected {
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+
+                let (fg, bg, modifier) = if is_selected {
+                    (SELECTED_FG, SELECTED_BG, Modifier::BOLD)
+                } else if is_viewing {
+                    (TEXT_SUCCESS, Color::Reset, Modifier::BOLD)
                 } else {
-                    Style::default().fg(Color::White)
+                    (TEXT_NORMAL, Color::Reset, Modifier::empty())
                 };
+
+                let style = Style::default().fg(fg).bg(bg).add_modifier(modifier);
                 ListItem::new(Line::from(vec![
                     Span::styled(prefix, style),
                     Span::styled(format!("󰓫 {}", table), style),
@@ -184,7 +195,7 @@ fn render_sidebar(app: &App, area: Rect, buf: &mut Buffer) {
             })
             .collect();
 
-        let list = List::new(items).highlight_style(Style::default().bg(Color::Rgb(40, 40, 60)));
+        let list = List::new(items);
         let mut state = ListState::default();
         if app.selected_table_index >= scroll_offset && app.selected_table_index < end_idx {
             state.select(Some(app.selected_table_index - scroll_offset));
@@ -200,18 +211,18 @@ fn render_sidebar(app: &App, area: Rect, buf: &mut Buffer) {
         format!("{} tables", app.tables.len())
     };
 
-    Paragraph::new(Span::styled(scroll_info, Style::default().fg(Color::DarkGray)))
+    Paragraph::new(Span::styled(scroll_info, Style::default().fg(TEXT_DIM)))
         .alignment(Alignment::Center)
         .render(footer_area, buf);
 }
 
 fn render_stats_panel(app: &App, area: Rect, buf: &mut Buffer) {
     let is_focused = app.focused_pane == FocusedPane::Stats;
-    let border_color = if is_focused { Color::Yellow } else { Color::Rgb(60, 60, 60) };
+    let border_color = if is_focused { BORDER_FOCUSED } else { BORDER_NORMAL };
 
     let block = Block::bordered()
         .title(" ◉ Live Monitor ")
-        .title_style(Style::default().fg(Color::Magenta).bold())
+        .title_style(Style::default().fg(TITLE_COLOR).add_modifier(Modifier::BOLD))
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(border_color));
 
@@ -257,8 +268,11 @@ fn render_ascii_graph_cell<F>(
     let observed_max = data.iter().max().copied().unwrap_or(1).max(1);
 
     let header_line = Line::from(vec![
-        Span::styled(format!(" {} ", label), Style::default().fg(Color::DarkGray)),
-        Span::styled(format!("{:>4}", current_value), Style::default().fg(color_fn(current_value, observed_max)).bold()),
+        Span::styled(format!(" {} ", label), Style::default().fg(TEXT_DIM)),
+        Span::styled(
+            format!("{:>4}", current_value),
+            Style::default().fg(color_fn(current_value, observed_max)).add_modifier(Modifier::BOLD),
+        ),
     ]);
     Paragraph::new(header_line).render(layout[0], buf);
 
@@ -270,27 +284,27 @@ fn render_ascii_graph_cell<F>(
 fn render_stats_info(app: &App, area: Rect, buf: &mut Buffer) {
     let lines = vec![
         Line::from(vec![
-            Span::styled("● ", Style::default().fg(Color::Rgb(80, 255, 80))),
-            Span::styled(&app.stats.host, Style::default().fg(Color::White)),
-            Span::styled(" │ ", Style::default().fg(Color::Rgb(60, 60, 60))),
-            Span::styled(&app.stats.database, Style::default().fg(Color::Cyan).bold()),
+            Span::styled("● ", Style::default().fg(TEXT_SUCCESS)),
+            Span::styled(&app.stats.host, Style::default().fg(TEXT_NORMAL)),
+            Span::styled(" │ ", Style::default().fg(SEPARATOR)),
+            Span::styled(&app.stats.database, Style::default().fg(TEXT_NORMAL).add_modifier(Modifier::BOLD)),
         ]),
         Line::from(vec![
-            Span::styled("Tables: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(format!("{}", app.stats.table_count), Style::default().fg(Color::White)),
-            Span::styled(" │ ", Style::default().fg(Color::Rgb(60, 60, 60))),
-            Span::styled("Last: ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Tables: ", Style::default().fg(TEXT_DIM)),
+            Span::styled(format!("{}", app.stats.table_count), Style::default().fg(TEXT_NORMAL)),
+            Span::styled(" │ ", Style::default().fg(SEPARATOR)),
+            Span::styled("Last: ", Style::default().fg(TEXT_DIM)),
             Span::styled(
                 app.stats.last_query_ms.map_or("—".to_string(), |ms| format!("{}ms", ms)),
-                latency_color(app.stats.last_query_ms.unwrap_or(0) as u64),
+                latency_style(app.stats.last_query_ms.unwrap_or(0) as u64),
             ),
-            Span::styled(" │ ", Style::default().fg(Color::Rgb(60, 60, 60))),
-            Span::styled("Total: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(format!("{}", app.stats.queries_run), Style::default().fg(Color::White)),
+            Span::styled(" │ ", Style::default().fg(SEPARATOR)),
+            Span::styled("Total: ", Style::default().fg(TEXT_DIM)),
+            Span::styled(format!("{}", app.stats.queries_run), Style::default().fg(TEXT_NORMAL)),
         ]),
         Line::from(Span::styled(
             if app.stats.pg_version.is_empty() { "PostgreSQL" } else { &app.stats.pg_version },
-            Style::default().fg(Color::Rgb(80, 80, 80)).italic(),
+            Style::default().fg(TEXT_DIM).italic(),
         )),
     ];
     Paragraph::new(lines).render(area, buf);
@@ -298,36 +312,35 @@ fn render_stats_info(app: &App, area: Rect, buf: &mut Buffer) {
 
 fn render_logs_panel(app: &App, area: Rect, buf: &mut Buffer) {
     let is_focused = app.focused_pane == FocusedPane::Logs;
-    let border_color = if is_focused { Color::Yellow } else { Color::Rgb(60, 60, 60) };
+    let border_color = if is_focused { BORDER_FOCUSED } else { BORDER_NORMAL };
 
     let block = Block::bordered()
         .title(" 󰌱 DB Logs ")
-        .title_style(Style::default().fg(Color::Cyan).bold())
+        .title_style(Style::default().fg(TITLE_COLOR).add_modifier(Modifier::BOLD))
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(border_color));
 
     let inner = block.inner(area);
     block.render(area, buf);
 
-    // Use TuiLoggerSmartWidget for scrollable log view
     let logs_widget = TuiLoggerSmartWidget::default()
-        .style_error(Style::default().fg(Color::Red))
-        .style_warn(Style::default().fg(Color::Yellow))
-        .style_info(Style::default().fg(Color::Cyan))
-        .style_debug(Style::default().fg(Color::Green))
-        .style_trace(Style::default().fg(Color::DarkGray))
+        .style_error(Style::default().fg(TEXT_ERROR))
+        .style_warn(Style::default().fg(Color::Rgb(255, 165, 0))) // Orange for warnings
+        .style_info(Style::default().fg(TEXT_NORMAL))
+        .style_debug(Style::default().fg(TEXT_SUCCESS))
+        .style_trace(Style::default().fg(TEXT_DIM))
         .state(&app.logs_state);
 
     logs_widget.render(inner, buf);
 }
 
-fn latency_color(ms: u64) -> Style {
+fn latency_style(ms: u64) -> Style {
     Style::default().fg(match ms {
-        0 => Color::DarkGray,
-        1..100 => Color::Rgb(80, 255, 80),
-        100..200 => Color::Rgb(255, 255, 0),
-        200..300 => Color::Rgb(255, 165, 0),
-        _ => Color::Rgb(255, 80, 80),
+        0 => TEXT_DIM,
+        1..100 => Color::Rgb(80, 255, 80),   // Green
+        100..200 => Color::Rgb(255, 255, 0), // Yellow
+        200..300 => Color::Rgb(255, 165, 0), // Orange
+        _ => Color::Rgb(255, 80, 80),        // Red
     })
 }
 
@@ -346,11 +359,11 @@ fn render_content_area(app: &App, area: Rect, buf: &mut Buffer) {
 
 fn render_placeholder(app: &App, area: Rect, buf: &mut Buffer) {
     let is_focused = app.focused_pane == FocusedPane::Results;
-    let border_color = if is_focused { Color::Yellow } else { Color::Rgb(60, 60, 60) };
+    let border_color = if is_focused { BORDER_FOCUSED } else { BORDER_NORMAL };
 
     let content_block = Block::bordered()
         .title(" Results ")
-        .title_style(Style::default().fg(Color::Magenta).bold())
+        .title_style(Style::default().fg(TITLE_COLOR).add_modifier(Modifier::BOLD))
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(border_color));
 
@@ -366,21 +379,21 @@ fn render_placeholder(app: &App, area: Rect, buf: &mut Buffer) {
     .split(content_inner);
 
     Paragraph::new(Line::from(vec![
-        Span::styled("Select a table ", Style::default().fg(Color::DarkGray)),
-        Span::styled("→", Style::default().fg(Color::Cyan)),
+        Span::styled("Select a table ", Style::default().fg(TEXT_DIM)),
+        Span::styled("→", Style::default().fg(TEXT_NORMAL)),
     ]))
     .alignment(Alignment::Center)
     .render(centered[1], buf);
 
     Paragraph::new(Line::from(vec![
-        Span::styled("↑↓", Style::default().fg(Color::Cyan)),
-        Span::styled(" navigate  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("Enter", Style::default().fg(Color::Cyan)),
-        Span::styled(" select  ", Style::default().fg(Color::DarkGray)),
-        Span::styled(":", Style::default().fg(Color::Cyan)),
-        Span::styled(" SQL  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("q", Style::default().fg(Color::Cyan)),
-        Span::styled(" quit", Style::default().fg(Color::DarkGray)),
+        Span::styled("↑↓", Style::default().fg(TEXT_NORMAL)),
+        Span::styled(" navigate  ", Style::default().fg(TEXT_DIM)),
+        Span::styled("Enter", Style::default().fg(TEXT_NORMAL)),
+        Span::styled(" select  ", Style::default().fg(TEXT_DIM)),
+        Span::styled(":", Style::default().fg(TEXT_NORMAL)),
+        Span::styled(" SQL  ", Style::default().fg(TEXT_DIM)),
+        Span::styled("q", Style::default().fg(TEXT_NORMAL)),
+        Span::styled(" quit", Style::default().fg(TEXT_DIM)),
     ]))
     .alignment(Alignment::Center)
     .render(centered[2], buf);
@@ -388,11 +401,11 @@ fn render_placeholder(app: &App, area: Rect, buf: &mut Buffer) {
 
 fn render_table_view(state: &TableViewState, app: &App, area: Rect, buf: &mut Buffer) {
     let is_focused = app.focused_pane == FocusedPane::Results;
-    let border_color = if is_focused { Color::Yellow } else { Color::Rgb(60, 60, 60) };
+    let border_color = if is_focused { BORDER_FOCUSED } else { BORDER_NORMAL };
 
     let content_block = Block::bordered()
         .title(format!(" {} ", state.table_name))
-        .title_style(Style::default().fg(Color::Magenta).bold())
+        .title_style(Style::default().fg(TITLE_COLOR).add_modifier(Modifier::BOLD))
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(border_color));
 
@@ -402,11 +415,11 @@ fn render_table_view(state: &TableViewState, app: &App, area: Rect, buf: &mut Bu
     let layout = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(content_inner);
 
     if state.loading {
-        render_centered_message(layout[0], buf, "⟳ ", "Loading...", Color::Yellow);
+        render_centered_message(layout[0], buf, "⟳ ", "Loading...", TEXT_NORMAL);
     } else if let Some(error) = &state.error {
-        render_centered_message(layout[0], buf, "✗ ", error, Color::Red);
+        render_centered_message(layout[0], buf, "✗ ", error, TEXT_ERROR);
     } else if state.rows.is_empty() {
-        render_centered_message(layout[0], buf, "", "<empty table>", Color::DarkGray);
+        render_centered_message(layout[0], buf, "", "<empty table>", TEXT_DIM);
     } else {
         render_data_table(&state.columns, &state.rows, state.selected_row, state.scroll_offset, layout[0], buf);
     }
@@ -416,12 +429,12 @@ fn render_table_view(state: &TableViewState, app: &App, area: Rect, buf: &mut Bu
 
 fn render_query_results(qr: &QueryResultState, app: &App, area: Rect, buf: &mut Buffer) {
     let is_focused = app.focused_pane == FocusedPane::Results;
-    let border_color = if is_focused { Color::Yellow } else { Color::Rgb(60, 60, 60) };
+    let border_color = if is_focused { BORDER_FOCUSED } else { BORDER_NORMAL };
     let title = if qr.error.is_some() { " Query Error " } else { " Query Results " };
 
     let content_block = Block::bordered()
         .title(title)
-        .title_style(Style::default().fg(Color::Magenta).bold())
+        .title_style(Style::default().fg(TITLE_COLOR).add_modifier(Modifier::BOLD))
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(border_color));
 
@@ -432,18 +445,18 @@ fn render_query_results(qr: &QueryResultState, app: &App, area: Rect, buf: &mut 
 
     if let Some(error) = &qr.error {
         Paragraph::new(error.clone())
-            .style(Style::default().fg(Color::Red))
+            .style(Style::default().fg(TEXT_ERROR))
             .wrap(Wrap { trim: false })
             .render(layout[0], buf);
     } else if qr.rows.is_empty() {
         if qr.columns.is_empty() {
-            render_centered_message(layout[0], buf, "✓ ", "Query executed successfully", Color::Green);
+            render_centered_message(layout[0], buf, "✓ ", "Query executed successfully", TEXT_SUCCESS);
         } else {
-            render_centered_message(layout[0], buf, "", "<no rows returned>", Color::DarkGray);
+            render_centered_message(layout[0], buf, "", "<no rows returned>", TEXT_DIM);
         }
     } else if qr.is_explain {
         let lines: Vec<Line> = qr.rows.iter()
-            .map(|row| Line::from(Span::styled(row.first().map(|s| s.as_str()).unwrap_or(""), Style::default().fg(Color::White))))
+            .map(|row| Line::from(Span::styled(row.first().map(|s| s.as_str()).unwrap_or(""), Style::default().fg(TEXT_NORMAL))))
             .collect();
         Paragraph::new(lines).wrap(Wrap { trim: false }).render(layout[0], buf);
     } else {
@@ -451,12 +464,12 @@ fn render_query_results(qr: &QueryResultState, app: &App, area: Rect, buf: &mut 
     }
 
     Paragraph::new(Line::from(vec![
-        Span::styled(format!("{} rows", qr.row_count), Style::default().fg(Color::Cyan)),
-        Span::styled(" │ ", Style::default().fg(Color::Rgb(60, 60, 60))),
-        Span::styled(format!("{}ms", qr.duration_ms), Style::default().fg(Color::Green)),
-        Span::styled(" │ ", Style::default().fg(Color::Rgb(60, 60, 60))),
-        Span::styled("c", Style::default().fg(Color::Cyan)),
-        Span::styled(" clear", Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{} rows", qr.row_count), Style::default().fg(TEXT_NORMAL)),
+        Span::styled(" │ ", Style::default().fg(SEPARATOR)),
+        Span::styled(format!("{}ms", qr.duration_ms), Style::default().fg(TEXT_SUCCESS)),
+        Span::styled(" │ ", Style::default().fg(SEPARATOR)),
+        Span::styled("c", Style::default().fg(TEXT_NORMAL)),
+        Span::styled(" clear", Style::default().fg(TEXT_DIM)),
     ]))
     .alignment(Alignment::Center)
     .render(layout[1], buf);
@@ -496,7 +509,9 @@ fn render_data_table(
     let constraints: Vec<Constraint> = col_widths.iter().map(|&w| Constraint::Length((w + 2) as u16)).collect();
 
     let header = Row::new(
-        columns.iter().map(|col| Cell::from(col.clone()).style(Style::default().fg(Color::Cyan).bold())),
+        columns.iter().map(|col| {
+            Cell::from(col.clone()).style(Style::default().fg(TEXT_NORMAL).add_modifier(Modifier::BOLD))
+        }),
     )
     .height(1);
 
@@ -508,18 +523,22 @@ fn render_data_table(
         .enumerate()
         .map(|(visible_idx, row)| {
             let actual_idx = scroll_offset + visible_idx;
+            let is_selected = actual_idx == selected_row;
+
             let cells: Vec<Cell> = row.iter().map(|cell| {
                 let display = if cell.len() > 30 { format!("{}…", &cell[..29]) } else { cell.clone() };
-                let style = if cell == "NULL" {
-                    Style::default().fg(Color::DarkGray).italic()
+                let style = if is_selected {
+                    Style::default().fg(SELECTED_FG).bg(SELECTED_BG)
+                } else if cell == "NULL" {
+                    Style::default().fg(TEXT_DIM).italic()
                 } else {
-                    Style::default().fg(Color::White)
+                    Style::default().fg(TEXT_NORMAL)
                 };
                 Cell::from(display).style(style)
             }).collect();
 
-            let row_style = if actual_idx == selected_row {
-                Style::default().bg(Color::Rgb(40, 40, 60))
+            let row_style = if is_selected {
+                Style::default().bg(SELECTED_BG).fg(SELECTED_FG)
             } else {
                 Style::default()
             };
@@ -529,23 +548,22 @@ fn render_data_table(
 
     Table::new(data_rows, constraints)
         .header(header)
-        .row_highlight_style(Style::default().bg(Color::Rgb(40, 40, 60)))
         .render(area, buf);
 }
 
 fn render_table_footer(state: &TableViewState, area: Rect, buf: &mut Buffer) {
     Paragraph::new(Line::from(vec![
-        Span::styled("Page ", Style::default().fg(Color::DarkGray)),
-        Span::styled(format!("{}", state.page + 1), Style::default().fg(Color::Cyan)),
-        Span::styled(format!("/{}", state.total_pages()), Style::default().fg(Color::DarkGray)),
-        Span::styled(" │ ", Style::default().fg(Color::Rgb(60, 60, 60))),
-        Span::styled("Rows: ", Style::default().fg(Color::DarkGray)),
-        Span::styled(format!("~{}", state.total_count), Style::default().fg(Color::Cyan)),
-        Span::styled(" │ ", Style::default().fg(Color::Rgb(60, 60, 60))),
-        Span::styled("←→", Style::default().fg(Color::Cyan)),
-        Span::styled(" page  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("↑↓", Style::default().fg(Color::Cyan)),
-        Span::styled(" row", Style::default().fg(Color::DarkGray)),
+        Span::styled("Page ", Style::default().fg(TEXT_DIM)),
+        Span::styled(format!("{}", state.page + 1), Style::default().fg(TEXT_NORMAL)),
+        Span::styled(format!("/{}", state.total_pages()), Style::default().fg(TEXT_DIM)),
+        Span::styled(" │ ", Style::default().fg(SEPARATOR)),
+        Span::styled("Rows: ", Style::default().fg(TEXT_DIM)),
+        Span::styled(format!("~{}", state.total_count), Style::default().fg(TEXT_NORMAL)),
+        Span::styled(" │ ", Style::default().fg(SEPARATOR)),
+        Span::styled("←→", Style::default().fg(TEXT_NORMAL)),
+        Span::styled(" page  ", Style::default().fg(TEXT_DIM)),
+        Span::styled("↑↓", Style::default().fg(TEXT_NORMAL)),
+        Span::styled(" row", Style::default().fg(TEXT_DIM)),
     ]))
     .alignment(Alignment::Center)
     .render(area, buf);
@@ -553,7 +571,7 @@ fn render_table_footer(state: &TableViewState, area: Rect, buf: &mut Buffer) {
 
 fn render_sql_editor(app: &App, area: Rect, buf: &mut Buffer) {
     let is_focused = app.focused_pane == FocusedPane::Editor;
-    let border_color = if is_focused { Color::Yellow } else { Color::Rgb(60, 60, 60) };
+    let border_color = if is_focused { BORDER_FOCUSED } else { BORDER_NORMAL };
 
     let title = if app.query_executing {
         format!(" SQL ⟳ {}ms ", app.query_elapsed_ms().unwrap_or(0))
@@ -566,9 +584,9 @@ fn render_sql_editor(app: &App, area: Rect, buf: &mut Buffer) {
     let block = Block::bordered()
         .title(title)
         .title_style(if is_focused {
-            Style::default().fg(Color::Yellow).bold()
+            Style::default().fg(BORDER_FOCUSED).add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::Rgb(100, 100, 100))
+            Style::default().fg(TEXT_DIM)
         })
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(border_color));
@@ -593,7 +611,7 @@ fn render_sql_editor(app: &App, area: Rect, buf: &mut Buffer) {
             if line.is_empty() && !is_focused && line_idx == 0 && lines.len() == 1 {
                 return Line::from(Span::styled(
                     "-- type : to focus · F5 or Shift+Enter to run",
-                    Style::default().fg(Color::Rgb(80, 80, 80)).italic(),
+                    Style::default().fg(TEXT_DIM).italic(),
                 ));
             }
             highlight_sql_line(line, line_idx, cursor, is_focused)
@@ -626,10 +644,10 @@ fn render_sql_editor(app: &App, area: Rect, buf: &mut Buffer) {
             if let Some(cell) = buf.cell_mut((scroll_x, editor_area.y + y)) {
                 if y == thumb_pos {
                     cell.set_char('█');
-                    cell.set_style(Style::default().fg(Color::Rgb(100, 100, 100)));
+                    cell.set_style(Style::default().fg(Color::Rgb(120, 120, 120)));
                 } else {
                     cell.set_char('│');
-                    cell.set_style(Style::default().fg(Color::Rgb(50, 50, 50)));
+                    cell.set_style(Style::default().fg(Color::Rgb(60, 60, 60)));
                 }
             }
         }
@@ -637,22 +655,22 @@ fn render_sql_editor(app: &App, area: Rect, buf: &mut Buffer) {
 
     let footer = if app.query_executing {
         Line::from(vec![
-            Span::styled("⟳ Running", Style::default().fg(Color::Yellow).bold()),
-            Span::styled(format!(" {}ms...", app.query_elapsed_ms().unwrap_or(0)), Style::default().fg(Color::Yellow)),
+            Span::styled("⟳ Running", Style::default().fg(BORDER_FOCUSED).add_modifier(Modifier::BOLD)),
+            Span::styled(format!(" {}ms...", app.query_elapsed_ms().unwrap_or(0)), Style::default().fg(BORDER_FOCUSED)),
         ])
     } else {
         let mut spans = vec![
-            Span::styled("F5", Style::default().fg(Color::Cyan)),
-            Span::styled("/", Style::default().fg(Color::DarkGray)),
-            Span::styled("Shift+Enter", Style::default().fg(Color::Cyan)),
-            Span::styled(" run  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("↑↓", Style::default().fg(Color::Cyan)),
-            Span::styled(" history", Style::default().fg(Color::DarkGray)),
+            Span::styled("F5", Style::default().fg(TEXT_NORMAL)),
+            Span::styled("/", Style::default().fg(TEXT_DIM)),
+            Span::styled("Shift+Enter", Style::default().fg(TEXT_NORMAL)),
+            Span::styled(" run  ", Style::default().fg(TEXT_DIM)),
+            Span::styled("↑↓", Style::default().fg(TEXT_NORMAL)),
+            Span::styled(" history", Style::default().fg(TEXT_DIM)),
         ];
         if let Some(idx) = app.history_index {
             spans.push(Span::styled(
                 format!("  │ history [{}/{}]", idx + 1, app.query_history.len()),
-                Style::default().fg(Color::Rgb(80, 80, 80)),
+                Style::default().fg(TEXT_DIM),
             ));
         }
         Line::from(spans)
@@ -668,6 +686,7 @@ fn highlight_sql_line(line: &str, line_idx: usize, cursor: (usize, usize), is_fo
     let mut i = 0;
 
     while i < chars.len() {
+        // String literals
         if chars[i] == '\'' {
             let start = i;
             i += 1;
@@ -677,15 +696,23 @@ fn highlight_sql_line(line: &str, line_idx: usize, cursor: (usize, usize), is_fo
             if i < chars.len() {
                 i += 1;
             }
-            spans.push(Span::styled(chars[start..i].iter().collect::<String>(), Style::default().fg(Color::Green)));
+            spans.push(Span::styled(
+                chars[start..i].iter().collect::<String>(),
+                Style::default().fg(TEXT_SUCCESS),
+            ));
             continue;
         }
 
+        // Comments
         if i + 1 < chars.len() && chars[i] == '-' && chars[i + 1] == '-' {
-            spans.push(Span::styled(chars[i..].iter().collect::<String>(), Style::default().fg(Color::DarkGray).italic()));
+            spans.push(Span::styled(
+                chars[i..].iter().collect::<String>(),
+                Style::default().fg(TEXT_DIM).italic(),
+            ));
             break;
         }
 
+        // Keywords
         let remaining: String = chars[i..].iter().collect();
         let mut found_keyword = false;
 
@@ -696,7 +723,10 @@ fn highlight_sql_line(line: &str, line_idx: usize, cursor: (usize, usize), is_fo
                 let is_start_boundary = i == 0 || (!chars[i - 1].is_alphanumeric() && chars[i - 1] != '_');
 
                 if is_word_boundary && is_start_boundary {
-                    spans.push(Span::styled(chars[i..next_idx].iter().collect::<String>(), Style::default().fg(Color::Blue).bold()));
+                    spans.push(Span::styled(
+                        chars[i..next_idx].iter().collect::<String>(),
+                        Style::default().fg(TEXT_NORMAL).add_modifier(Modifier::BOLD),
+                    ));
                     i = next_idx;
                     found_keyword = true;
                     break;
@@ -707,19 +737,28 @@ fn highlight_sql_line(line: &str, line_idx: usize, cursor: (usize, usize), is_fo
             continue;
         }
 
+        // Numbers
         if chars[i].is_ascii_digit() {
             let start = i;
             while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.') {
                 i += 1;
             }
-            spans.push(Span::styled(chars[start..i].iter().collect::<String>(), Style::default().fg(Color::Rgb(255, 180, 100))));
+            spans.push(Span::styled(
+                chars[start..i].iter().collect::<String>(),
+                Style::default().fg(Color::Rgb(255, 180, 100)), // Warm orange for numbers
+            ));
             continue;
         }
 
-        spans.push(Span::styled(chars[i].to_string(), Style::default().fg(Color::White)));
+        // Default text
+        spans.push(Span::styled(chars[i].to_string(), Style::default().fg(TEXT_NORMAL)));
         i += 1;
     }
 
-    let line_style = if is_cursor_line { Style::default().bg(Color::Rgb(30, 30, 40)) } else { Style::default() };
+    let line_style = if is_cursor_line {
+        Style::default().bg(Color::Rgb(40, 40, 40))
+    } else {
+        Style::default()
+    };
     Line::from(spans).style(line_style)
 }
