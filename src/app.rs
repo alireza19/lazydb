@@ -115,23 +115,24 @@ pub enum FocusedPane {
 }
 
 impl FocusedPane {
+    /// Tab order: Sidebar → Results → Editor → Logs → Stats → (loop)
     pub fn next(self) -> Self {
         match self {
-            Self::Sidebar => Self::Stats,
-            Self::Stats => Self::Results,
+            Self::Sidebar => Self::Results,
             Self::Results => Self::Editor,
             Self::Editor => Self::Logs,
-            Self::Logs => Self::Sidebar,
+            Self::Logs => Self::Stats,
+            Self::Stats => Self::Sidebar,
         }
     }
 
     pub fn prev(self) -> Self {
         match self {
-            Self::Sidebar => Self::Logs,
-            Self::Stats => Self::Sidebar,
-            Self::Results => Self::Stats,
+            Self::Sidebar => Self::Stats,
+            Self::Results => Self::Sidebar,
             Self::Editor => Self::Results,
             Self::Logs => Self::Editor,
+            Self::Stats => Self::Logs,
         }
     }
 
