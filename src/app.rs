@@ -40,19 +40,131 @@ pub enum TreeNodeId {
 #[derive(Parser, Debug)]
 #[command(name = "lazydb")]
 #[command(about = "A lazydocker-inspired database TUI written in Rust")]
+#[command(
+    after_help = "EXAMPLES:\n    lazydb postgres://user:pass@localhost/mydb\n    lazydb  # uses DATABASE_URL or config file"
+)]
 pub struct Cli {
-    #[arg(long = "url", short = 'u')]
-    pub database_url: Option<String>,
+    /// Database connection URL (postgres://user:pass@host/db)
+    #[arg(value_name = "URL")]
+    pub url: Option<String>,
+
+    /// Database URL (deprecated, use positional argument instead)
+    #[arg(long = "url", short = 'u', hide = true)]
+    pub url_flag: Option<String>,
+}
+
+/// Config file structure for ~/.config/lazydb/config.toml
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct Config {
+    #[serde(default)]
+    pub connection: ConnectionConfig,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct ConnectionConfig {
+    pub default: Option<String>,
 }
 
 impl Cli {
     pub fn get_database_url(&self) -> color_eyre::Result<String> {
-        self.database_url.clone().map_or_else(
-            || env::var("DATABASE_URL").map_err(|_| {
-                color_eyre::eyre::eyre!("DATABASE_URL not set. Provide --url or set DATABASE_URL environment variable.")
-            }),
-            Ok,
-        )
+        // Priority: positional arg → --url flag → DATABASE_URL env → config file
+        if let Some(url) = &self.url {
+            return Ok(url.clone());
+        }
+
+        if let Some(url) = &self.url_flag {
+            return Ok(url.clone());
+        }
+
+        if let Ok(url) = env::var("DATABASE_URL") {
+            return Ok(url);
+        }
+
+        if let Some(url) = Self::load_url_from_config()? {
+            return Ok(url);
+        }
+
+        Self::ensure_config_exists()?;
+
+        Err(color_eyre::eyre::eyre!(
+            "No database URL found.\n\n\
+            Provide a connection URL using one of these methods:\n\n\
+            1. Positional argument:\n\
+               lazydb postgres://user:pass@localhost:5432/mydb\n\n\
+            2. Environment variable:\n\
+               export DATABASE_URL=postgres://user:pass@localhost:5432/mydb\n\
+               lazydb\n\n\
+            3. Config file ({}):\n\
+               [connection]\n\
+               default = \"postgres://user:pass@localhost:5432/mydb\"\n",
+            Self::config_path().display()
+        ))
+    }
+
+    fn config_path() -> std::path::PathBuf {
+        // Use XDG_CONFIG_HOME if set, otherwise ~/.config (consistent across platforms)
+        let config_dir = env::var("XDG_CONFIG_HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                directories::BaseDirs::new()
+                    .map(|dirs| dirs.home_dir().join(".config"))
+                    .unwrap_or_else(|| std::path::PathBuf::from("~/.config"))
+            });
+        config_dir.join("lazydb").join("config.toml")
+    }
+
+    fn load_url_from_config() -> color_eyre::Result<Option<String>> {
+        let config_path = Self::config_path();
+        if !config_path.exists() {
+            return Ok(None);
+        }
+
+        let contents = std::fs::read_to_string(&config_path).map_err(|e| {
+            color_eyre::eyre::eyre!(
+                "Failed to read config file {}: {}",
+                config_path.display(),
+                e
+            )
+        })?;
+
+        let config: Config = toml::from_str(&contents).map_err(|e| {
+            color_eyre::eyre::eyre!(
+                "Failed to parse config file {}: {}",
+                config_path.display(),
+                e
+            )
+        })?;
+
+        Ok(config.connection.default)
+    }
+
+    fn ensure_config_exists() -> color_eyre::Result<()> {
+        let config_path = Self::config_path();
+        if config_path.exists() {
+            return Ok(());
+        }
+
+        if let Some(parent) = config_path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+
+        let default_config = r#"# lazydb configuration
+# Uncomment and edit the line below to set your default database connection
+
+[connection]
+# default = "postgres://user:password@localhost:5432/database"
+"#;
+
+        std::fs::write(&config_path, default_config).map_err(|e| {
+            color_eyre::eyre::eyre!(
+                "Failed to create config file {}: {}",
+                config_path.display(),
+                e
+            )
+        })?;
+
+        tracing::info!("Created config file at {}", config_path.display());
+        Ok(())
     }
 }
 

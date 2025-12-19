@@ -22,6 +22,9 @@ tui-textarea = "0.7"
 unicode-width = "0.2"
 tui-logger = { version = "0.17.4", features = ["tracing-support"] }
 tui-tree-widget = "0.23.1"
+directories = "6.0.0"
+toml = "0.9.10"
+serde = { version = "1.0.228", features = ["derive"] }
 
 # Read the optimization guideline for more details: https://ratatui.rs/recipes/apps/release-your-app/#optimizations
 [profile.release]
