@@ -88,7 +88,8 @@ where
             if value == 0 {
                 // For zero values, show a dim dot at the bottom only
                 let row = height - 1;
-                grid[row][col] = Span::styled(DOT_SINGLE.to_string(), Style::default().fg(ZERO_COLOR));
+                grid[row][col] =
+                    Span::styled(DOT_SINGLE.to_string(), Style::default().fg(ZERO_COLOR));
             } else {
                 // Calculate top_row: higher values = smaller row number (closer to top)
                 // top_row = H - 1 - (v * (H - 1) / max)
@@ -190,6 +191,10 @@ where
     F: Fn(u64, u64) -> Color,
 {
     pub fn new(data: &'a VecDeque<u64>, max: u64, color_fn: F) -> Self {
-        Self { data, max, color_fn }
+        Self {
+            data,
+            max,
+            color_fn,
+        }
     }
 }

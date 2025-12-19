@@ -4,8 +4,8 @@ use crate::event::{
 };
 use clap::Parser;
 use ratatui::{
-    crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
     DefaultTerminal,
+    crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
 };
 use sqlx::{Column, PgPool, Row};
 use std::collections::VecDeque;
@@ -26,8 +26,15 @@ pub const SCHEMA_REFRESH_SECS: u64 = 10;
 pub enum TreeNodeId {
     Root,
     Schema(String),
-    Table { schema: String, table: String },
-    Column { schema: String, table: String, column: String },
+    Table {
+        schema: String,
+        table: String,
+    },
+    Column {
+        schema: String,
+        table: String,
+        column: String,
+    },
 }
 
 #[derive(Parser, Debug)]
@@ -71,7 +78,11 @@ pub struct TableViewState {
 
 impl TableViewState {
     pub fn total_pages(&self) -> usize {
-        if self.total_count == 0 { 1 } else { (self.total_count as usize).div_ceil(PAGE_SIZE) }
+        if self.total_count == 0 {
+            1
+        } else {
+            (self.total_count as usize).div_ceil(PAGE_SIZE)
+        }
     }
 
     pub fn ensure_visible(&mut self, visible_rows: usize) {
@@ -256,7 +267,10 @@ fn parse_host_from_url(url: &str) -> String {
     url.find('@')
         .map(|at| {
             let after = &url[at + 1..];
-            after.find('/').map_or(after, |slash| &after[..slash]).to_string()
+            after
+                .find('/')
+                .map_or(after, |slash| &after[..slash])
+                .to_string()
         })
         .unwrap_or_else(|| "localhost".to_string())
 }
@@ -372,7 +386,11 @@ impl App {
             }
             FocusedPane::Logs => {
                 use tui_logger::TuiWidgetEvent;
-                let event = if delta < 0 { TuiWidgetEvent::UpKey } else { TuiWidgetEvent::DownKey };
+                let event = if delta < 0 {
+                    TuiWidgetEvent::UpKey
+                } else {
+                    TuiWidgetEvent::DownKey
+                };
                 for _ in 0..delta.unsigned_abs() {
                     self.logs_state.transition(event);
                 }
@@ -408,7 +426,11 @@ impl App {
         if self.sql_editor.lines().is_empty() {
             return;
         }
-        let movement = if delta < 0 { tui_textarea::CursorMove::Up } else { tui_textarea::CursorMove::Down };
+        let movement = if delta < 0 {
+            tui_textarea::CursorMove::Up
+        } else {
+            tui_textarea::CursorMove::Down
+        };
         for _ in 0..delta.unsigned_abs() {
             self.sql_editor.move_cursor(movement);
         }
@@ -472,7 +494,10 @@ impl App {
                 if self.tree_state.selected().is_empty() {
                     self.tree_state.select(vec![TreeNodeId::Root]);
                     self.tree_state.open(vec![TreeNodeId::Root]);
-                    self.tree_state.open(vec![TreeNodeId::Root, TreeNodeId::Schema("public".to_string())]);
+                    self.tree_state.open(vec![
+                        TreeNodeId::Root,
+                        TreeNodeId::Schema("public".to_string()),
+                    ]);
                 }
 
                 if self.schema_handle.is_none() {
@@ -481,8 +506,10 @@ impl App {
             }
             AppEvent::TableDataLoaded(result) => {
                 if let CurrentView::TableView(ref mut state) = self.current_view {
-                match result {
-                        Ok(data) if state.table_name == data.table_name && state.page == data.page => {
+                    match result {
+                        Ok(data)
+                            if state.table_name == data.table_name && state.page == data.page =>
+                        {
                             state.columns = data.columns;
                             state.rows = data.rows;
                             state.total_count = data.total_count;
@@ -490,9 +517,9 @@ impl App {
                             state.error = None;
                             if state.selected_row >= state.rows.len() && !state.rows.is_empty() {
                                 state.selected_row = state.rows.len() - 1;
+                            }
                         }
-                    }
-                    Err(error) => {
+                        Err(error) => {
                             state.loading = false;
                             state.error = Some(error);
                         }
@@ -545,24 +572,29 @@ impl App {
     }
 
     fn start_schema_refresh_task(&mut self) {
-        let ConnectionState::Connected { pool, .. } = &self.connection else { return };
-            let pool = pool.clone();
-            let sender = self.events.sender();
+        let ConnectionState::Connected { pool, .. } = &self.connection else {
+            return;
+        };
+        let pool = pool.clone();
+        let sender = self.events.sender();
 
-            let handle = tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(SCHEMA_REFRESH_SECS));
+            interval.tick().await;
+            loop {
                 interval.tick().await;
-                loop {
-                    interval.tick().await;
                 if sender.is_closed() || pool.is_closed() {
-                        break;
-                    }
-                let structure = fetch_database_structure(&pool).await;
-                if sender.send(Event::App(AppEvent::SchemaLoaded(structure))).is_err() {
-                        break;
-                    }
+                    break;
                 }
-            });
+                let structure = fetch_database_structure(&pool).await;
+                if sender
+                    .send(Event::App(AppEvent::SchemaLoaded(structure)))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
         self.schema_handle = Some(handle);
     }
 
@@ -585,14 +617,19 @@ impl App {
                     break;
                 }
                 let pool_size = pool.size();
-                if sender.send(Event::App(AppEvent::SparklineTick { pool_size })).is_err() {
+                if sender
+                    .send(Event::App(AppEvent::SparklineTick { pool_size }))
+                    .is_err()
+                {
                     break;
                 }
                 stats_counter += 1;
                 if stats_counter >= 5 {
                     stats_counter = 0;
                     if let Some(update) = fetch_stats(&pool).await
-                        && sender.send(Event::App(AppEvent::StatsUpdated(update))).is_err()
+                        && sender
+                            .send(Event::App(AppEvent::StatsUpdated(update)))
+                            .is_err()
                     {
                         break;
                     }
@@ -603,15 +640,17 @@ impl App {
     }
 
     fn fetch_table_data(&self, table_name: &str, page: usize) {
-        let ConnectionState::Connected { pool, .. } = &self.connection else { return };
-            let pool = pool.clone();
-            let sender = self.events.sender();
-            let table_name = table_name.to_string();
+        let ConnectionState::Connected { pool, .. } = &self.connection else {
+            return;
+        };
+        let pool = pool.clone();
+        let sender = self.events.sender();
+        let table_name = table_name.to_string();
 
-            tokio::spawn(async move {
-                let result = fetch_table_page(&pool, &table_name, page).await;
-                let _ = sender.send(Event::App(AppEvent::TableDataLoaded(result)));
-            });
+        tokio::spawn(async move {
+            let result = fetch_table_page(&pool, &table_name, page).await;
+            let _ = sender.send(Event::App(AppEvent::TableDataLoaded(result)));
+        });
     }
 
     fn execute_query(&mut self) {
@@ -629,18 +668,20 @@ impl App {
         self.history_index = None;
         self.saved_editor_content = None;
 
-        let ConnectionState::Connected { pool, .. } = &self.connection else { return };
-            let pool = pool.clone();
-            let sender = self.events.sender();
+        let ConnectionState::Connected { pool, .. } = &self.connection else {
+            return;
+        };
+        let pool = pool.clone();
+        let sender = self.events.sender();
 
-            self.query_executing = true;
-            self.query_start_time = Some(Instant::now());
-            info!("Executing query: {}", query);
+        self.query_executing = true;
+        self.query_start_time = Some(Instant::now());
+        info!("Executing query: {}", query);
 
-            tokio::spawn(async move {
-                let result = execute_sql_query(&pool, &query).await;
-                let _ = sender.send(Event::App(AppEvent::QueryExecuted(result)));
-            });
+        tokio::spawn(async move {
+            let result = execute_sql_query(&pool, &query).await;
+            let _ = sender.send(Event::App(AppEvent::QueryExecuted(result)));
+        });
     }
 
     pub fn handle_key_events(&mut self, key_event: KeyEvent) -> color_eyre::Result<()> {
@@ -713,7 +754,10 @@ impl App {
     }
 
     fn handle_editor_keys(&mut self, key_event: KeyEvent) -> color_eyre::Result<()> {
-        debug!("Editor key: code={:?} modifiers={:?}", key_event.code, key_event.modifiers);
+        debug!(
+            "Editor key: code={:?} modifiers={:?}",
+            key_event.code, key_event.modifiers
+        );
 
         if is_execute_key_combo(&key_event) {
             if !self.query_executing {
@@ -724,13 +768,15 @@ impl App {
 
         match key_event.code {
             KeyCode::Esc => {
-            self.focused_pane = if self.show_query_results || matches!(self.current_view, CurrentView::TableView(_)) {
-                FocusedPane::Results
-            } else {
-                FocusedPane::Sidebar
-            };
-            return Ok(());
-        }
+                self.focused_pane = if self.show_query_results
+                    || matches!(self.current_view, CurrentView::TableView(_))
+                {
+                    FocusedPane::Results
+                } else {
+                    FocusedPane::Sidebar
+                };
+                return Ok(());
+            }
             KeyCode::PageUp => {
                 for _ in 0..DEFAULT_VISIBLE_ROWS {
                     self.sql_editor.move_cursor(tui_textarea::CursorMove::Up);
@@ -751,23 +797,26 @@ impl App {
                 return Ok(());
             }
             KeyCode::End if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.sql_editor.move_cursor(tui_textarea::CursorMove::Bottom);
+                self.sql_editor
+                    .move_cursor(tui_textarea::CursorMove::Bottom);
                 self.update_editor_scroll();
                 return Ok(());
             }
             KeyCode::Up if key_event.modifiers.is_empty() => {
-            let (row, _) = self.sql_editor.cursor();
-            if row == 0 && !self.query_history.is_empty() {
-                self.navigate_history_up();
-                return Ok(());
+                let (row, _) = self.sql_editor.cursor();
+                if row == 0 && !self.query_history.is_empty() {
+                    self.navigate_history_up();
+                    return Ok(());
+                }
             }
-        }
             KeyCode::Down if key_event.modifiers.is_empty() => {
-            let (row, _) = self.sql_editor.cursor();
-                if row >= self.sql_editor.lines().len().saturating_sub(1) && self.history_index.is_some() {
-                self.navigate_history_down();
-                return Ok(());
-            }
+                let (row, _) = self.sql_editor.cursor();
+                if row >= self.sql_editor.lines().len().saturating_sub(1)
+                    && self.history_index.is_some()
+                {
+                    self.navigate_history_down();
+                    return Ok(());
+                }
             }
             _ => {}
         }
@@ -784,11 +833,14 @@ impl App {
         if self.history_index.is_none() {
             self.saved_editor_content = Some(self.sql_editor.lines().join("\n"));
         }
-        let new_index = self.history_index.map_or(0, |i| (i + 1).min(self.query_history.len() - 1));
+        let new_index = self
+            .history_index
+            .map_or(0, |i| (i + 1).min(self.query_history.len() - 1));
         self.history_index = Some(new_index);
         if let Some(query) = self.query_history.get(new_index) {
             self.sql_editor = TextArea::new(query.lines().map(String::from).collect());
-            self.sql_editor.set_cursor_line_style(ratatui::style::Style::default());
+            self.sql_editor
+                .set_cursor_line_style(ratatui::style::Style::default());
         }
     }
 
@@ -799,14 +851,16 @@ impl App {
                 self.history_index = None;
                 if let Some(content) = self.saved_editor_content.take() {
                     self.sql_editor = TextArea::new(content.lines().map(String::from).collect());
-                    self.sql_editor.set_cursor_line_style(ratatui::style::Style::default());
+                    self.sql_editor
+                        .set_cursor_line_style(ratatui::style::Style::default());
                 }
             }
             Some(i) => {
                 self.history_index = Some(i - 1);
                 if let Some(query) = self.query_history.get(i - 1) {
                     self.sql_editor = TextArea::new(query.lines().map(String::from).collect());
-                    self.sql_editor.set_cursor_line_style(ratatui::style::Style::default());
+                    self.sql_editor
+                        .set_cursor_line_style(ratatui::style::Style::default());
                 }
             }
         }
@@ -839,7 +893,9 @@ impl App {
     }
 
     fn get_visible_tree_paths(&self) -> Vec<Vec<TreeNodeId>> {
-        let Some(structure) = &self.db_structure else { return vec![] };
+        let Some(structure) = &self.db_structure else {
+            return vec![];
+        };
         let opened = self.tree_state.opened();
         let mut paths = Vec::new();
 
@@ -862,7 +918,10 @@ impl App {
                 let table_path = vec![
                     TreeNodeId::Root,
                     TreeNodeId::Schema(schema.name.clone()),
-                    TreeNodeId::Table { schema: schema.name.clone(), table: table.name.clone() },
+                    TreeNodeId::Table {
+                        schema: schema.name.clone(),
+                        table: table.name.clone(),
+                    },
                 ];
                 paths.push(table_path.clone());
 
@@ -874,8 +933,15 @@ impl App {
                     paths.push(vec![
                         TreeNodeId::Root,
                         TreeNodeId::Schema(schema.name.clone()),
-                        TreeNodeId::Table { schema: schema.name.clone(), table: table.name.clone() },
-                        TreeNodeId::Column { schema: schema.name.clone(), table: table.name.clone(), column: col.name.clone() },
+                        TreeNodeId::Table {
+                            schema: schema.name.clone(),
+                            table: table.name.clone(),
+                        },
+                        TreeNodeId::Column {
+                            schema: schema.name.clone(),
+                            table: table.name.clone(),
+                            column: col.name.clone(),
+                        },
                     ]);
                 }
             }
@@ -893,7 +959,7 @@ impl App {
         let current_idx = paths.iter().position(|p| p == current).unwrap_or(0);
         let new_idx = if delta < 0 {
             current_idx.saturating_sub((-delta) as usize)
-                    } else {
+        } else {
             (current_idx + delta as usize).min(paths.len() - 1)
         };
 
@@ -914,7 +980,8 @@ impl App {
         }
 
         if selected.len() > 1 {
-            self.tree_state.select(selected[..selected.len() - 1].to_vec());
+            self.tree_state
+                .select(selected[..selected.len() - 1].to_vec());
         }
     }
 
@@ -930,7 +997,7 @@ impl App {
             Some(TreeNodeId::Root) | Some(TreeNodeId::Schema(_)) => {
                 if is_expanded {
                     self.tree_navigate(1);
-                    } else {
+                } else {
                     self.tree_state.open(selected);
                 }
             }
@@ -989,7 +1056,11 @@ impl App {
         self.show_query_results = false;
         self.selected_table = Some((schema.clone(), table.clone()));
 
-        let full_name = if schema == "public" { table } else { format!("{}.{}", schema, table) };
+        let full_name = if schema == "public" {
+            table
+        } else {
+            format!("{}.{}", schema, table)
+        };
 
         self.current_view = CurrentView::TableView(TableViewState {
             table_name: full_name.clone(),
@@ -1006,7 +1077,9 @@ impl App {
     }
 
     fn refresh_schema(&mut self) {
-        let ConnectionState::Connected { pool, .. } = &self.connection else { return };
+        let ConnectionState::Connected { pool, .. } = &self.connection else {
+            return;
+        };
         let pool = pool.clone();
         let sender = self.events.sender();
         tokio::spawn(async move {
@@ -1025,9 +1098,9 @@ impl App {
         if matches!(key_event.code, KeyCode::Char('b') | KeyCode::Esc)
             && matches!(self.current_view, CurrentView::TableView(_))
         {
-                self.current_view = CurrentView::TableList;
-                self.show_query_results = false;
-                self.focused_pane = FocusedPane::Sidebar;
+            self.current_view = CurrentView::TableList;
+            self.show_query_results = false;
+            self.focused_pane = FocusedPane::Sidebar;
             return Ok(());
         }
 
@@ -1040,34 +1113,46 @@ impl App {
             if let Some(ref mut qr) = self.query_result
                 && !qr.rows.is_empty()
             {
-                handle_list_navigation(key_event.code, &mut qr.selected_row, &mut qr.scroll_offset, qr.rows.len());
+                handle_list_navigation(
+                    key_event.code,
+                    &mut qr.selected_row,
+                    &mut qr.scroll_offset,
+                    qr.rows.len(),
+                );
             }
         } else if let CurrentView::TableView(state) = &mut self.current_view {
-                    if !state.rows.is_empty() {
-                handle_list_navigation(key_event.code, &mut state.selected_row, &mut state.scroll_offset, state.rows.len());
+            if !state.rows.is_empty() {
+                handle_list_navigation(
+                    key_event.code,
+                    &mut state.selected_row,
+                    &mut state.scroll_offset,
+                    state.rows.len(),
+                );
             }
 
             let mut fetch_page = None;
             match key_event.code {
                 KeyCode::Left | KeyCode::Char('h') if state.page > 0 && !state.loading => {
-                        state.page -= 1;
-                        state.loading = true;
-                        state.selected_row = 0;
-                        state.scroll_offset = 0;
-                        fetch_page = Some((state.table_name.clone(), state.page));
-                    }
-                KeyCode::Right | KeyCode::Char('l') if state.page < state.total_pages().saturating_sub(1) && !state.loading => {
-                        state.page += 1;
-                        state.loading = true;
-                        state.selected_row = 0;
-                        state.scroll_offset = 0;
-                        fetch_page = Some((state.table_name.clone(), state.page));
+                    state.page -= 1;
+                    state.loading = true;
+                    state.selected_row = 0;
+                    state.scroll_offset = 0;
+                    fetch_page = Some((state.table_name.clone(), state.page));
+                }
+                KeyCode::Right | KeyCode::Char('l')
+                    if state.page < state.total_pages().saturating_sub(1) && !state.loading =>
+                {
+                    state.page += 1;
+                    state.loading = true;
+                    state.selected_row = 0;
+                    state.scroll_offset = 0;
+                    fetch_page = Some((state.table_name.clone(), state.page));
                 }
                 _ => {}
             }
-        if let Some((table_name, page)) = fetch_page {
-            self.fetch_table_data(&table_name, page);
-        }
+            if let Some((table_name, page)) = fetch_page {
+                self.fetch_table_data(&table_name, page);
+            }
         }
         Ok(())
     }
@@ -1077,16 +1162,29 @@ impl App {
     }
 }
 
-fn handle_list_navigation(code: KeyCode, selected: &mut usize, scroll_offset: &mut usize, len: usize) {
+fn handle_list_navigation(
+    code: KeyCode,
+    selected: &mut usize,
+    scroll_offset: &mut usize,
+    len: usize,
+) {
     match code {
         KeyCode::Up | KeyCode::Char('k') => {
-            *selected = if *selected > 0 { *selected - 1 } else { len - 1 };
+            *selected = if *selected > 0 {
+                *selected - 1
+            } else {
+                len - 1
+            };
             if *selected == len - 1 {
                 *scroll_offset = len.saturating_sub(DEFAULT_VISIBLE_ROWS);
             }
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            *selected = if *selected < len - 1 { *selected + 1 } else { 0 };
+            *selected = if *selected < len - 1 {
+                *selected + 1
+            } else {
+                0
+            };
             if *selected == 0 {
                 *scroll_offset = 0;
             }
@@ -1129,8 +1227,12 @@ fn is_execute_key_combo(key_event: &KeyEvent) -> bool {
 
 impl Drop for App {
     fn drop(&mut self) {
-        if let Some(h) = self.stats_handle.take() { h.abort(); }
-        if let Some(h) = self.schema_handle.take() { h.abort(); }
+        if let Some(h) = self.stats_handle.take() {
+            h.abort();
+        }
+        if let Some(h) = self.schema_handle.take() {
+            h.abort();
+        }
     }
 }
 
@@ -1189,8 +1291,12 @@ async fn fetch_database_structure(pool: &PgPool) -> DatabaseStructure {
     use std::collections::{HashMap, HashSet};
 
     let pk_set: HashSet<_> = pk_columns.into_iter().collect();
-    let mut schema_map: HashMap<String, Vec<DbTable>> = schemas.iter().map(|s| (s.clone(), Vec::new())).collect();
-    let mut table_map: HashMap<(String, String), Vec<DbColumn>> = tables.iter().map(|(s, t)| ((s.clone(), t.clone()), Vec::new())).collect();
+    let mut schema_map: HashMap<String, Vec<DbTable>> =
+        schemas.iter().map(|s| (s.clone(), Vec::new())).collect();
+    let mut table_map: HashMap<(String, String), Vec<DbColumn>> = tables
+        .iter()
+        .map(|(s, t)| ((s.clone(), t.clone()), Vec::new()))
+        .collect();
 
     for (schema, table, col_name, data_type, is_nullable, ordinal) in columns {
         let col = DbColumn {
@@ -1206,18 +1312,28 @@ async fn fetch_database_structure(pool: &PgPool) -> DatabaseStructure {
     }
 
     for (schema, table) in tables {
-        let columns = table_map.remove(&(schema.clone(), table.clone())).unwrap_or_default();
+        let columns = table_map
+            .remove(&(schema.clone(), table.clone()))
+            .unwrap_or_default();
         if let Some(tables) = schema_map.get_mut(&schema) {
-            tables.push(DbTable { name: table, columns });
+            tables.push(DbTable {
+                name: table,
+                columns,
+            });
         }
     }
 
     let db_schemas: Vec<DbSchema> = schemas
         .into_iter()
-        .map(|name| DbSchema { tables: schema_map.remove(&name).unwrap_or_default(), name })
+        .map(|name| DbSchema {
+            tables: schema_map.remove(&name).unwrap_or_default(),
+            name,
+        })
         .collect();
 
-    DatabaseStructure { schemas: db_schemas }
+    DatabaseStructure {
+        schemas: db_schemas,
+    }
 }
 
 fn format_data_type(data_type: &str) -> String {
@@ -1247,10 +1363,17 @@ async fn fetch_stats(pool: &PgPool) -> Option<StatsUpdate> {
     .await
     .unwrap_or(0);
 
-    Some(StatsUpdate { pg_version, total_rows })
+    Some(StatsUpdate {
+        pg_version,
+        total_rows,
+    })
 }
 
-async fn fetch_table_page(pool: &PgPool, table_name: &str, page: usize) -> Result<TableDataResult, String> {
+async fn fetch_table_page(
+    pool: &PgPool,
+    table_name: &str,
+    page: usize,
+) -> Result<TableDataResult, String> {
     let offset = page * PAGE_SIZE;
 
     let total_count: (i64,) = sqlx::query_as(&format!(r#"SELECT COUNT(*) FROM "{}""#, table_name))
@@ -1258,10 +1381,13 @@ async fn fetch_table_page(pool: &PgPool, table_name: &str, page: usize) -> Resul
         .await
         .map_err(|e| format!("Failed to get row count: {e}"))?;
 
-    let rows = sqlx::query(&format!(r#"SELECT * FROM "{}" LIMIT {} OFFSET {}"#, table_name, PAGE_SIZE, offset))
-        .fetch_all(pool)
-        .await
-        .map_err(|e| format!("Failed to fetch data: {e}"))?;
+    let rows = sqlx::query(&format!(
+        r#"SELECT * FROM "{}" LIMIT {} OFFSET {}"#,
+        table_name, PAGE_SIZE, offset
+    ))
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("Failed to fetch data: {e}"))?;
 
     let columns: Vec<String> = if rows.is_empty() {
         sqlx::query_as::<_, (String,)>(&format!(
@@ -1269,17 +1395,24 @@ async fn fetch_table_page(pool: &PgPool, table_name: &str, page: usize) -> Resul
                WHERE table_schema = 'public' AND table_name = '{}' ORDER BY ordinal_position"#,
             table_name
         ))
-            .fetch_all(pool)
-            .await
+        .fetch_all(pool)
+        .await
         .map_err(|e| format!("Failed to get column info: {e}"))?
         .into_iter()
         .map(|(name,)| name)
-            .collect()
+        .collect()
     } else {
-        rows[0].columns().iter().map(|c| c.name().to_string()).collect()
+        rows[0]
+            .columns()
+            .iter()
+            .map(|c| c.name().to_string())
+            .collect()
     };
 
-    let string_rows: Vec<Vec<String>> = rows.iter().map(|row| row_to_strings(row, columns.len())).collect();
+    let string_rows: Vec<Vec<String>> = rows
+        .iter()
+        .map(|row| row_to_strings(row, columns.len()))
+        .collect();
 
     Ok(TableDataResult {
         table_name: table_name.to_string(),
@@ -1294,7 +1427,10 @@ async fn execute_sql_query(pool: &PgPool, query: &str) -> Result<QueryResult, St
     let start = Instant::now();
     let is_explain = query.trim().to_uppercase().starts_with("EXPLAIN");
 
-    let rows = sqlx::query(query).fetch_all(pool).await.map_err(|e| format!("{e}"))?;
+    let rows = sqlx::query(query)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| format!("{e}"))?;
     let duration_ms = start.elapsed().as_millis();
 
     let columns: Vec<String> = rows
@@ -1302,10 +1438,20 @@ async fn execute_sql_query(pool: &PgPool, query: &str) -> Result<QueryResult, St
         .map(|r| r.columns().iter().map(|c| c.name().to_string()).collect())
         .unwrap_or_default();
 
-    let string_rows: Vec<Vec<String>> = rows.iter().map(|row| row_to_strings(row, columns.len())).collect();
+    let string_rows: Vec<Vec<String>> = rows
+        .iter()
+        .map(|row| row_to_strings(row, columns.len()))
+        .collect();
     let row_count = string_rows.len();
 
-    Ok(QueryResult { query: query.to_string(), columns, rows: string_rows, row_count, duration_ms, is_explain })
+    Ok(QueryResult {
+        query: query.to_string(),
+        columns,
+        rows: string_rows,
+        row_count,
+        duration_ms,
+        is_explain,
+    })
 }
 
 fn row_to_strings(row: &sqlx::postgres::PgRow, col_count: usize) -> Vec<String> {
@@ -1316,11 +1462,26 @@ fn row_to_strings(row: &sqlx::postgres::PgRow, col_count: usize) -> Vec<String> 
                 .or_else(|_| row.try_get::<i32, _>(i).map(|v| v.to_string()))
                 .or_else(|_| row.try_get::<f64, _>(i).map(|v| v.to_string()))
                 .or_else(|_| row.try_get::<bool, _>(i).map(|v| v.to_string()))
-                .or_else(|_| row.try_get::<Option<String>, _>(i).map(|v| v.unwrap_or_else(|| "NULL".into())))
-                .or_else(|_| row.try_get::<Option<i64>, _>(i).map(|v| v.map_or("NULL".into(), |n| n.to_string())))
-                .or_else(|_| row.try_get::<Option<i32>, _>(i).map(|v| v.map_or("NULL".into(), |n| n.to_string())))
-                .or_else(|_| row.try_get::<Option<f64>, _>(i).map(|v| v.map_or("NULL".into(), |n| n.to_string())))
-                .or_else(|_| row.try_get::<Option<bool>, _>(i).map(|v| v.map_or("NULL".into(), |b| b.to_string())))
+                .or_else(|_| {
+                    row.try_get::<Option<String>, _>(i)
+                        .map(|v| v.unwrap_or_else(|| "NULL".into()))
+                })
+                .or_else(|_| {
+                    row.try_get::<Option<i64>, _>(i)
+                        .map(|v| v.map_or("NULL".into(), |n| n.to_string()))
+                })
+                .or_else(|_| {
+                    row.try_get::<Option<i32>, _>(i)
+                        .map(|v| v.map_or("NULL".into(), |n| n.to_string()))
+                })
+                .or_else(|_| {
+                    row.try_get::<Option<f64>, _>(i)
+                        .map(|v| v.map_or("NULL".into(), |n| n.to_string()))
+                })
+                .or_else(|_| {
+                    row.try_get::<Option<bool>, _>(i)
+                        .map(|v| v.map_or("NULL".into(), |b| b.to_string()))
+                })
                 .unwrap_or_else(|_| "<?>".into())
         })
         .collect()

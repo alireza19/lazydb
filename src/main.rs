@@ -5,8 +5,8 @@ use crossterm::{
     execute,
 };
 use std::io::stdout;
-use tui_logger::{init_logger, set_default_level, TuiTracingSubscriberLayer};
 use tracing_subscriber::prelude::*;
+use tui_logger::{TuiTracingSubscriberLayer, init_logger, set_default_level};
 
 pub mod app;
 pub mod dotline;
