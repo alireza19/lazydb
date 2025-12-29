@@ -20,7 +20,7 @@ tracing = "0.1.43"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 tui-textarea = "0.7"
 unicode-width = "0.2"
-tui-logger = { version = "0.17.4", features = ["tracing-support"] }
+tui-logger = { version = "0.18.0", features = ["tracing-support"] }
 tui-tree-widget = "0.23.1"
 directories = "6.0.0"
 toml = "0.9.10"
