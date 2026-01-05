@@ -10,7 +10,7 @@ edition = "2024"
 crossterm = { version = "0.28.1", features = ["event-stream"] }
 futures = "0.3.31"
 ratatui = "0.29.0"
-tokio = { version = "1.40.0", features = ["full"] }
+tokio = { version = "1.49.0", features = ["full"] }
 color-eyre = "0.6.3"
 sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "postgres", "migrate", "tls-rustls"] }
 anyhow = "1.0.100"
