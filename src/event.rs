@@ -1,7 +1,8 @@
+use crate::app::DbType;
 use color_eyre::eyre::OptionExt;
 use futures::{FutureExt, StreamExt};
 use ratatui::crossterm::event::Event as CrosstermEvent;
-use sqlx::PgPool;
+use sqlx::AnyPool;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -83,7 +84,7 @@ pub enum AppEvent {
     /// Quit the application.
     Quit,
     /// Database connection result.
-    ConnectionResult(Result<(PgPool, String), String>),
+    ConnectionResult(Result<(AnyPool, String, DbType), String>),
     /// Tables loaded from database (legacy, kept for compatibility).
     TablesLoaded(Vec<String>),
     /// Full database schema structure loaded.

@@ -8,7 +8,8 @@ use ratatui::{
 use tui_logger::TuiLoggerSmartWidget;
 
 use crate::app::{
-    App, ConnectionState, CurrentView, FocusedPane, QueryResultState, TableViewState, TreeNodeId,
+    App, ConnectionManagerMode, ConnectionState, CurrentView, FocusedPane, QueryResultState,
+    TableViewState, TreeNodeId,
 };
 use crate::dotline::{AsciiDotGraph, make_color_fn};
 
@@ -133,6 +134,11 @@ impl Widget for &App {
             CurrentView::ConnectionStatus => render_connection_status(self, area, buf),
             _ => render_main_layout(self, area, buf),
         }
+
+        // Render connection manager modal on top if visible
+        if self.connection_manager.visible {
+            render_connection_manager(self, area, buf);
+        }
     }
 }
 
@@ -149,38 +155,67 @@ fn render_connection_status(app: &App, area: Rect, buf: &mut Buffer) {
     ])
     .split(inner);
 
-    let status_line = match &app.connection {
-        ConnectionState::Connecting => Line::from(vec![
-            Span::styled("⟳ ", Style::default().fg(TEXT_NORMAL)),
-            Span::styled("Connecting...", Style::default().fg(TEXT_NORMAL)),
-        ]),
-        ConnectionState::Connected { db_name, .. } => Line::from(vec![
-            Span::styled("● ", Style::default().fg(TEXT_SUCCESS)),
-            Span::styled(
-                format!("Connected to {db_name}"),
-                Style::default().fg(TEXT_SUCCESS),
-            ),
-        ]),
-        ConnectionState::Failed { error } => Line::from(vec![
-            Span::styled("✗ ", Style::default().fg(TEXT_ERROR)),
-            Span::styled(
-                format!("Connection failed: {error}"),
-                Style::default().fg(TEXT_ERROR),
-            ),
-        ]),
+    let (status_line, hint_line) = match &app.connection {
+        ConnectionState::NotConfigured => (
+            Line::from(vec![
+                Span::styled("○ ", Style::default().fg(TEXT_DIM)),
+                Span::styled("No connection configured", Style::default().fg(TEXT_DIM)),
+            ]),
+            Line::from(vec![Span::styled(
+                "Select a connection to get started",
+                Style::default().fg(TEXT_DIM),
+            )]),
+        ),
+        ConnectionState::Connecting => (
+            Line::from(vec![
+                Span::styled("⟳ ", Style::default().fg(TEXT_NORMAL)),
+                Span::styled("Connecting...", Style::default().fg(TEXT_NORMAL)),
+            ]),
+            Line::from(vec![
+                Span::styled("Press ", Style::default().fg(TEXT_DIM)),
+                Span::styled("q", Style::default().fg(TEXT_NORMAL).bold()),
+                Span::styled(" to quit", Style::default().fg(TEXT_DIM)),
+            ]),
+        ),
+        ConnectionState::Connected { db_name, .. } => (
+            Line::from(vec![
+                Span::styled("● ", Style::default().fg(TEXT_SUCCESS)),
+                Span::styled(
+                    format!("Connected to {db_name}"),
+                    Style::default().fg(TEXT_SUCCESS),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("Press ", Style::default().fg(TEXT_DIM)),
+                Span::styled("q", Style::default().fg(TEXT_NORMAL).bold()),
+                Span::styled(" to quit", Style::default().fg(TEXT_DIM)),
+            ]),
+        ),
+        ConnectionState::Failed { error } => (
+            Line::from(vec![
+                Span::styled("✗ ", Style::default().fg(TEXT_ERROR)),
+                Span::styled(
+                    format!("Connection failed: {error}"),
+                    Style::default().fg(TEXT_ERROR),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("Press ", Style::default().fg(TEXT_DIM)),
+                Span::styled("c", Style::default().fg(TEXT_NORMAL).bold()),
+                Span::styled(" for connections  ", Style::default().fg(TEXT_DIM)),
+                Span::styled("q", Style::default().fg(TEXT_NORMAL).bold()),
+                Span::styled(" to quit", Style::default().fg(TEXT_DIM)),
+            ]),
+        ),
     };
 
     Paragraph::new(status_line)
         .alignment(Alignment::Center)
         .render(layout[1], buf);
 
-    Paragraph::new(Line::from(vec![
-        Span::styled("Press ", Style::default().fg(TEXT_DIM)),
-        Span::styled("q", Style::default().fg(TEXT_NORMAL).bold()),
-        Span::styled(" to quit", Style::default().fg(TEXT_DIM)),
-    ]))
-    .alignment(Alignment::Center)
-    .render(layout[2], buf);
+    Paragraph::new(hint_line)
+        .alignment(Alignment::Center)
+        .render(layout[2], buf);
 }
 
 fn render_main_layout(app: &App, area: Rect, buf: &mut Buffer) {
@@ -219,6 +254,8 @@ fn render_global_status_bar(app: &App, area: Rect, buf: &mut Buffer) {
         Span::styled(" cycle  ", Style::default().fg(TEXT_DIM)),
         Span::styled(":", Style::default().fg(TEXT_NORMAL)),
         Span::styled(" SQL  ", Style::default().fg(TEXT_DIM)),
+        Span::styled("c", Style::default().fg(TEXT_NORMAL)),
+        Span::styled(" connections  ", Style::default().fg(TEXT_DIM)),
         Span::styled("q", Style::default().fg(TEXT_NORMAL)),
         Span::styled(" quit", Style::default().fg(TEXT_DIM)),
     ]))
@@ -1068,4 +1105,240 @@ fn highlight_sql_line(
         Style::default()
     };
     Line::from(spans).style(line_style)
+}
+
+fn render_connection_manager(app: &App, area: Rect, buf: &mut Buffer) {
+    // Calculate centered modal size (60% width, 60% height, min 40x10)
+    let modal_width = (area.width * 60 / 100).max(40).min(area.width - 4);
+    let modal_height = (area.height * 60 / 100).max(10).min(area.height - 4);
+    let modal_x = (area.width.saturating_sub(modal_width)) / 2;
+    let modal_y = (area.height.saturating_sub(modal_height)) / 2;
+    let modal_area = Rect::new(modal_x, modal_y, modal_width, modal_height);
+
+    // Clear the modal area with a dark background
+    for y in modal_area.y..modal_area.y + modal_area.height {
+        for x in modal_area.x..modal_area.x + modal_area.width {
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                cell.set_char(' ');
+                cell.set_style(Style::default().bg(Color::Rgb(20, 20, 20)));
+            }
+        }
+    }
+
+    let cm = &app.connection_manager;
+    let title = match cm.mode {
+        ConnectionManagerMode::List => " Connections ",
+        ConnectionManagerMode::AddingName => " New Connection - Name ",
+        ConnectionManagerMode::AddingUrl => " New Connection - URL ",
+    };
+
+    let block = Block::bordered()
+        .title(title)
+        .title_style(Style::default().fg(BORDER_FOCUSED).bold())
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(BORDER_FOCUSED));
+
+    let inner = block.inner(modal_area);
+    block.render(modal_area, buf);
+
+    match cm.mode {
+        ConnectionManagerMode::List => {
+            render_connection_list(cm, inner, buf);
+        }
+        ConnectionManagerMode::AddingName => {
+            render_add_connection_input(cm, inner, buf, true);
+        }
+        ConnectionManagerMode::AddingUrl => {
+            render_add_connection_input(cm, inner, buf, false);
+        }
+    }
+}
+
+fn render_connection_list(cm: &crate::app::ConnectionManagerState, area: Rect, buf: &mut Buffer) {
+    let layout = Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).split(area);
+    let list_area = layout[0];
+    let footer_area = layout[1];
+
+    if cm.connections.is_empty() {
+        let centered = Layout::vertical([
+            Constraint::Fill(1),
+            Constraint::Length(2),
+            Constraint::Fill(1),
+        ])
+        .split(list_area);
+
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                "No saved connections",
+                Style::default().fg(TEXT_DIM),
+            )),
+            Line::from(vec![
+                Span::styled("Press ", Style::default().fg(TEXT_DIM)),
+                Span::styled("a", Style::default().fg(TEXT_NORMAL).bold()),
+                Span::styled(" to add one", Style::default().fg(TEXT_DIM)),
+            ]),
+        ])
+        .alignment(Alignment::Center)
+        .render(centered[1], buf);
+    } else {
+        let visible_height = list_area.height as usize;
+        let scroll_offset = if cm.selected_index >= visible_height {
+            cm.selected_index - visible_height + 1
+        } else {
+            0
+        };
+
+        let lines: Vec<Line> = cm
+            .connections
+            .iter()
+            .enumerate()
+            .skip(scroll_offset)
+            .take(visible_height)
+            .map(|(i, conn)| {
+                let is_selected = i == cm.selected_index;
+                let last_used = conn
+                    .last_used
+                    .map(|dt| dt.format("%Y-%m-%d").to_string())
+                    .unwrap_or_else(|| "never".to_string());
+
+                let line = Line::from(vec![
+                    Span::styled(
+                        if is_selected { "▸ " } else { "  " },
+                        Style::default().fg(BORDER_FOCUSED),
+                    ),
+                    Span::styled(
+                        format!("{:<20}", truncate_str(&conn.name, 20)),
+                        Style::default().fg(TEXT_NORMAL).bold(),
+                    ),
+                    Span::styled(" │ ", Style::default().fg(SEPARATOR)),
+                    Span::styled(
+                        format!("{:<20}", truncate_str(&conn.display_host(), 20)),
+                        Style::default().fg(TEXT_DIM),
+                    ),
+                    Span::styled(" │ ", Style::default().fg(SEPARATOR)),
+                    Span::styled(
+                        format!("{:<8}", conn.db_type()),
+                        Style::default().fg(TEXT_SUCCESS),
+                    ),
+                    Span::styled(" │ ", Style::default().fg(SEPARATOR)),
+                    Span::styled(last_used, Style::default().fg(TEXT_DIM)),
+                ]);
+
+                if is_selected {
+                    line.style(Style::default().bg(SELECTED_BG).fg(SELECTED_FG))
+                } else {
+                    line
+                }
+            })
+            .collect();
+
+        Paragraph::new(lines).render(list_area, buf);
+    }
+
+    // Footer with keybindings
+    Paragraph::new(vec![Line::from(vec![
+        Span::styled("↑↓", Style::default().fg(TEXT_NORMAL)),
+        Span::styled(" navigate  ", Style::default().fg(TEXT_DIM)),
+        Span::styled("Enter", Style::default().fg(TEXT_NORMAL)),
+        Span::styled(" connect  ", Style::default().fg(TEXT_DIM)),
+        Span::styled("a", Style::default().fg(TEXT_NORMAL)),
+        Span::styled(" add  ", Style::default().fg(TEXT_DIM)),
+        Span::styled("d", Style::default().fg(TEXT_NORMAL)),
+        Span::styled(" delete  ", Style::default().fg(TEXT_DIM)),
+        Span::styled("q", Style::default().fg(TEXT_NORMAL)),
+        Span::styled("/", Style::default().fg(TEXT_DIM)),
+        Span::styled("Esc", Style::default().fg(TEXT_NORMAL)),
+        Span::styled(" close", Style::default().fg(TEXT_DIM)),
+    ])])
+    .alignment(Alignment::Center)
+    .render(footer_area, buf);
+}
+
+fn render_add_connection_input(
+    cm: &crate::app::ConnectionManagerState,
+    area: Rect,
+    buf: &mut Buffer,
+    is_name_step: bool,
+) {
+    let layout = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Length(3),
+        Constraint::Length(2),
+        Constraint::Length(3),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .split(area);
+
+    // Name field
+    let name_label_style = if is_name_step {
+        Style::default().fg(BORDER_FOCUSED).bold()
+    } else {
+        Style::default().fg(TEXT_DIM)
+    };
+    Paragraph::new(Line::from(Span::styled("Name / Alias:", name_label_style)))
+        .render(layout[0], buf);
+
+    let name_box = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(if is_name_step {
+            Style::default().fg(BORDER_FOCUSED)
+        } else {
+            Style::default().fg(TEXT_DIM)
+        });
+    let name_inner = name_box.inner(layout[1]);
+    name_box.render(layout[1], buf);
+
+    let name_display = if is_name_step {
+        format!("{}▌", cm.input_name)
+    } else {
+        cm.input_name.clone()
+    };
+    Paragraph::new(Span::styled(name_display, Style::default().fg(TEXT_NORMAL)))
+        .render(name_inner, buf);
+
+    // URL field
+    let url_label_style = if !is_name_step {
+        Style::default().fg(BORDER_FOCUSED).bold()
+    } else {
+        Style::default().fg(TEXT_DIM)
+    };
+    Paragraph::new(Line::from(Span::styled("Connection URL:", url_label_style)))
+        .render(layout[2], buf);
+
+    let url_box = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(if !is_name_step {
+            Style::default().fg(BORDER_FOCUSED)
+        } else {
+            Style::default().fg(TEXT_DIM)
+        });
+    let url_inner = url_box.inner(layout[3]);
+    url_box.render(layout[3], buf);
+
+    let url_display = if !is_name_step {
+        format!("{}▌", cm.input_url)
+    } else {
+        cm.input_url.clone()
+    };
+    Paragraph::new(Span::styled(url_display, Style::default().fg(TEXT_NORMAL)))
+        .render(url_inner, buf);
+
+    // Footer
+    let footer_text = if is_name_step {
+        "Enter to continue  │  Esc to cancel"
+    } else {
+        "Enter to save  │  Esc to cancel"
+    };
+    Paragraph::new(Span::styled(footer_text, Style::default().fg(TEXT_DIM)))
+        .alignment(Alignment::Center)
+        .render(layout[5], buf);
+}
+
+fn truncate_str(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        format!("{}…", &s[..max_len - 1])
+    }
 }

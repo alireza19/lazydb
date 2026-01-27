@@ -26,8 +26,10 @@ async fn main() -> color_eyre::Result<()> {
         .with(TuiTracingSubscriberLayer)
         .init();
 
+    sqlx::any::install_default_drivers();
+
     let cli = Cli::parse();
-    let database_url = cli.get_database_url()?;
+    let database_url = cli.get_database_url();
 
     let terminal = ratatui::init();
     execute!(stdout(), EnableBracketedPaste, EnableMouseCapture)?;

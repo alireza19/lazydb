@@ -2,12 +2,13 @@ use crate::event::{
     AppEvent, DatabaseStructure, DbColumn, DbSchema, DbTable, Event, EventHandler, QueryResult,
     StatsUpdate, TableDataResult,
 };
+use chrono::{DateTime, Utc};
 use clap::Parser;
 use ratatui::{
     DefaultTerminal,
     crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
 };
-use sqlx::{Column, PgPool, Row};
+use sqlx::{AnyPool, Column, Row};
 use std::collections::VecDeque;
 use std::env;
 use std::time::{Duration, Instant};
@@ -65,40 +66,238 @@ pub struct ConnectionConfig {
     pub default: Option<String>,
 }
 
+/// Saved connection entry for connections.toml
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SavedConnection {
+    pub name: String,
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used: Option<DateTime<Utc>>,
+}
+
+impl SavedConnection {
+    pub fn new(name: String, url: String) -> Self {
+        Self {
+            name,
+            url,
+            last_used: None,
+        }
+    }
+
+    /// Extract host/database info from URL for display
+    pub fn display_host(&self) -> String {
+        self.url
+            .find('@')
+            .map(|at| {
+                let after = &self.url[at + 1..];
+                after
+                    .find('/')
+                    .map_or(after.to_string(), |slash| after[..slash].to_string())
+            })
+            .unwrap_or_else(|| "localhost".to_string())
+    }
+
+    /// Detect database type from URL
+    pub fn db_type(&self) -> &'static str {
+        if self.url.starts_with("postgres://") || self.url.starts_with("postgresql://") {
+            "postgres"
+        } else if self.url.starts_with("mysql://") {
+            "mysql"
+        } else if self.url.starts_with("sqlite://") {
+            "sqlite"
+        } else {
+            "unknown"
+        }
+    }
+}
+
+/// File structure for ~/.config/lazydb/connections.toml
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct ConnectionsFile {
+    #[serde(default)]
+    pub connections: Vec<SavedConnection>,
+}
+
+impl ConnectionsFile {
+    pub fn path() -> std::path::PathBuf {
+        let config_dir = env::var("XDG_CONFIG_HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                directories::BaseDirs::new()
+                    .map(|dirs| dirs.home_dir().join(".config"))
+                    .unwrap_or_else(|| std::path::PathBuf::from("~/.config"))
+            });
+        config_dir.join("lazydb").join("connections.toml")
+    }
+
+    pub fn load() -> Self {
+        let path = Self::path();
+        if !path.exists() {
+            let default = Self::create_default();
+            let _ = default.save();
+            return default;
+        }
+
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|contents| toml::from_str(&contents).ok())
+            .unwrap_or_else(Self::create_default)
+    }
+
+    pub fn save(&self) -> color_eyre::Result<()> {
+        let path = Self::path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let contents = toml::to_string_pretty(self)?;
+        std::fs::write(&path, contents)?;
+        Ok(())
+    }
+
+    fn create_default() -> Self {
+        // Start with empty connections - user will add their own
+        Self {
+            connections: Vec::new(),
+        }
+    }
+}
+
+/// State for the connection manager modal
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectionManagerMode {
+    List,
+    AddingName,
+    AddingUrl,
+}
+
+#[derive(Debug)]
+pub struct ConnectionManagerState {
+    pub visible: bool,
+    pub connections: Vec<SavedConnection>,
+    pub selected_index: usize,
+    pub mode: ConnectionManagerMode,
+    pub input_name: String,
+    pub input_url: String,
+}
+
+impl Default for ConnectionManagerState {
+    fn default() -> Self {
+        Self {
+            visible: false,
+            connections: Vec::new(),
+            selected_index: 0,
+            mode: ConnectionManagerMode::List,
+            input_name: String::new(),
+            input_url: String::new(),
+        }
+    }
+}
+
+impl ConnectionManagerState {
+    pub fn open(&mut self) {
+        let file = ConnectionsFile::load();
+        self.connections = file.connections;
+        self.visible = true;
+        self.selected_index = 0;
+        self.mode = ConnectionManagerMode::List;
+        self.input_name.clear();
+        self.input_url.clear();
+    }
+
+    pub fn close(&mut self) {
+        self.visible = false;
+        self.mode = ConnectionManagerMode::List;
+        self.input_name.clear();
+        self.input_url.clear();
+    }
+
+    pub fn save_connections(&self) {
+        let file = ConnectionsFile {
+            connections: self.connections.clone(),
+        };
+        let _ = file.save();
+    }
+
+    pub fn start_adding(&mut self) {
+        self.mode = ConnectionManagerMode::AddingName;
+        self.input_name.clear();
+        self.input_url.clear();
+    }
+
+    pub fn finish_adding(&mut self) -> bool {
+        if self.input_name.trim().is_empty() || self.input_url.trim().is_empty() {
+            return false;
+        }
+        self.connections.push(SavedConnection::new(
+            self.input_name.trim().to_string(),
+            self.input_url.trim().to_string(),
+        ));
+        self.selected_index = self.connections.len().saturating_sub(1);
+        self.save_connections();
+        self.mode = ConnectionManagerMode::List;
+        self.input_name.clear();
+        self.input_url.clear();
+        true
+    }
+
+    pub fn cancel_adding(&mut self) {
+        self.mode = ConnectionManagerMode::List;
+        self.input_name.clear();
+        self.input_url.clear();
+    }
+
+    pub fn delete_selected(&mut self) {
+        if !self.connections.is_empty() {
+            self.connections.remove(self.selected_index);
+            if self.selected_index >= self.connections.len() && !self.connections.is_empty() {
+                self.selected_index = self.connections.len() - 1;
+            }
+            self.save_connections();
+        }
+    }
+
+    pub fn mark_used(&mut self, index: usize) {
+        if let Some(conn) = self.connections.get_mut(index) {
+            conn.last_used = Some(Utc::now());
+            self.save_connections();
+        }
+    }
+
+    pub fn navigate(&mut self, delta: i32) {
+        if self.connections.is_empty() {
+            return;
+        }
+        let len = self.connections.len() as i32;
+        let new_idx = (self.selected_index as i32 + delta).rem_euclid(len);
+        self.selected_index = new_idx as usize;
+    }
+}
+
 impl Cli {
-    pub fn get_database_url(&self) -> color_eyre::Result<String> {
+    /// Try to get database URL from available sources.
+    /// Returns None if no URL is configured (graceful fallback to connection manager).
+    pub fn get_database_url(&self) -> Option<String> {
         // Priority: positional arg → --url flag → DATABASE_URL env → config file
         if let Some(url) = &self.url {
-            return Ok(url.clone());
+            return Some(url.clone());
         }
 
         if let Some(url) = &self.url_flag {
-            return Ok(url.clone());
+            return Some(url.clone());
         }
 
         if let Ok(url) = env::var("DATABASE_URL") {
-            return Ok(url);
+            return Some(url);
         }
 
-        if let Some(url) = Self::load_url_from_config()? {
-            return Ok(url);
+        if let Some(url) = Self::load_url_from_config().ok().flatten() {
+            return Some(url);
         }
 
-        Self::ensure_config_exists()?;
+        // Ensure config exists for future use, but don't fail
+        let _ = Self::ensure_config_exists();
 
-        Err(color_eyre::eyre::eyre!(
-            "No database URL found.\n\n\
-            Provide a connection URL using one of these methods:\n\n\
-            1. Positional argument:\n\
-               lazydb postgres://user:pass@localhost:5432/mydb\n\n\
-            2. Environment variable:\n\
-               export DATABASE_URL=postgres://user:pass@localhost:5432/mydb\n\
-               lazydb\n\n\
-            3. Config file ({}):\n\
-               [connection]\n\
-               default = \"postgres://user:pass@localhost:5432/mydb\"\n",
-            Self::config_path().display()
-        ))
+        None
     }
 
     fn config_path() -> std::path::PathBuf {
@@ -168,11 +367,41 @@ impl Cli {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DbType {
+    Postgres,
+    MySQL,
+}
+
+impl DbType {
+    pub fn from_url(url: &str) -> Self {
+        if url.starts_with("mysql://") || url.starts_with("mariadb://") {
+            Self::MySQL
+        } else {
+            Self::Postgres
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Postgres => "PostgreSQL",
+            Self::MySQL => "MySQL",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum ConnectionState {
+    NotConfigured,
     Connecting,
-    Connected { pool: PgPool, db_name: String },
-    Failed { error: String },
+    Connected {
+        pool: AnyPool,
+        db_name: String,
+        db_type: DbType,
+    },
+    Failed {
+        error: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -357,6 +586,7 @@ pub struct App {
     pub db_structure: Option<DatabaseStructure>,
     pub tree_state: TreeState<TreeNodeId>,
     pub selected_table: Option<(String, String)>,
+    pub connection_manager: ConnectionManagerState,
 }
 
 impl std::fmt::Debug for App {
@@ -372,6 +602,10 @@ impl std::fmt::Debug for App {
             .field("stats", &self.stats)
             .field("db_structure", &self.db_structure)
             .field("selected_table", &self.selected_table)
+            .field(
+                "connection_manager.visible",
+                &self.connection_manager.visible,
+            )
             .finish()
     }
 }
@@ -389,25 +623,49 @@ fn parse_host_from_url(url: &str) -> String {
 }
 
 impl App {
-    pub fn new(database_url: String) -> Self {
+    pub fn new(database_url: Option<String>) -> Self {
         let events = EventHandler::new();
-        let sender = events.sender();
-        let host = parse_host_from_url(&database_url);
-        let url_for_task = database_url.clone();
-
-        tokio::spawn(async move {
-            let result = connect_to_database(&url_for_task).await;
-            let _ = sender.send(Event::App(AppEvent::ConnectionResult(result)));
-        });
 
         let mut sql_editor = TextArea::default();
         sql_editor.set_cursor_line_style(ratatui::style::Style::default());
         sql_editor.set_placeholder_text("-- type : to focus · F5 to run");
 
+        // If we have a URL, start connecting; otherwise open connection manager
+        let (connection_state, host, url, connection_manager) = match database_url {
+            Some(url) => {
+                let sender = events.sender();
+                let host = parse_host_from_url(&url);
+                let url_for_task = url.clone();
+
+                tokio::spawn(async move {
+                    let result = connect_to_database(&url_for_task).await;
+                    let _ = sender.send(Event::App(AppEvent::ConnectionResult(result)));
+                });
+
+                (
+                    ConnectionState::Connecting,
+                    host,
+                    url,
+                    ConnectionManagerState::default(),
+                )
+            }
+            None => {
+                // No URL provided - open connection manager immediately
+                let mut cm = ConnectionManagerState::default();
+                cm.open();
+                (
+                    ConnectionState::NotConfigured,
+                    String::new(),
+                    String::new(),
+                    cm,
+                )
+            }
+        };
+
         Self {
             running: true,
-            connection: ConnectionState::Connecting,
-            database_url,
+            connection: connection_state,
+            database_url: url,
             current_view: CurrentView::ConnectionStatus,
             tables: Vec::new(),
             selected_table_index: 0,
@@ -446,6 +704,7 @@ impl App {
             db_structure: None,
             tree_state: TreeState::default(),
             selected_table: None,
+            connection_manager,
         }
     }
 
@@ -461,7 +720,18 @@ impl App {
                         self.handle_key_events(key_event)?
                     }
                     crossterm::event::Event::Paste(data) => {
-                        if self.focused_pane == FocusedPane::Editor {
+                        if self.connection_manager.visible {
+                            // Handle paste in connection manager input fields
+                            match self.connection_manager.mode {
+                                ConnectionManagerMode::AddingName => {
+                                    self.connection_manager.input_name.push_str(&data);
+                                }
+                                ConnectionManagerMode::AddingUrl => {
+                                    self.connection_manager.input_url.push_str(&data);
+                                }
+                                ConnectionManagerMode::List => {}
+                            }
+                        } else if self.focused_pane == FocusedPane::Editor {
                             self.sql_editor.insert_str(&data);
                         }
                     }
@@ -565,16 +835,20 @@ impl App {
         match event {
             AppEvent::Quit => self.running = false,
             AppEvent::ConnectionResult(result) => match result {
-                Ok((pool, db_name)) => {
+                Ok((pool, db_name, db_type)) => {
                     let sender = self.events.sender();
                     let pool_clone = pool.clone();
                     tokio::spawn(async move {
-                        let structure = fetch_database_structure(&pool_clone).await;
+                        let structure = fetch_database_structure(&pool_clone, db_type).await;
                         let _ = sender.send(Event::App(AppEvent::SchemaLoaded(structure)));
                     });
                     self.stats.database = db_name.clone();
-                    self.start_stats_task(&pool);
-                    self.connection = ConnectionState::Connected { pool, db_name };
+                    self.start_stats_task(&pool, db_type);
+                    self.connection = ConnectionState::Connected {
+                        pool,
+                        db_name,
+                        db_type,
+                    };
                     self.current_view = CurrentView::TableList;
                 }
                 Err(error) => {
@@ -685,10 +959,11 @@ impl App {
     }
 
     fn start_schema_refresh_task(&mut self) {
-        let ConnectionState::Connected { pool, .. } = &self.connection else {
+        let ConnectionState::Connected { pool, db_type, .. } = &self.connection else {
             return;
         };
         let pool = pool.clone();
+        let db_type = *db_type;
         let sender = self.events.sender();
 
         let handle = tokio::spawn(async move {
@@ -699,7 +974,7 @@ impl App {
                 if sender.is_closed() || pool.is_closed() {
                     break;
                 }
-                let structure = fetch_database_structure(&pool).await;
+                let structure = fetch_database_structure(&pool, db_type).await;
                 if sender
                     .send(Event::App(AppEvent::SchemaLoaded(structure)))
                     .is_err()
@@ -711,12 +986,12 @@ impl App {
         self.schema_handle = Some(handle);
     }
 
-    fn start_stats_task(&mut self, pool: &PgPool) {
+    fn start_stats_task(&mut self, pool: &AnyPool, db_type: DbType) {
         let pool = pool.clone();
         let sender = self.events.sender();
 
         let handle = tokio::spawn(async move {
-            if let Some(update) = fetch_stats(&pool).await {
+            if let Some(update) = fetch_stats(&pool, db_type).await {
                 let _ = sender.send(Event::App(AppEvent::StatsUpdated(update)));
             }
 
@@ -739,7 +1014,7 @@ impl App {
                 stats_counter += 1;
                 if stats_counter >= 5 {
                     stats_counter = 0;
-                    if let Some(update) = fetch_stats(&pool).await
+                    if let Some(update) = fetch_stats(&pool, db_type).await
                         && sender
                             .send(Event::App(AppEvent::StatsUpdated(update)))
                             .is_err()
@@ -753,15 +1028,16 @@ impl App {
     }
 
     fn fetch_table_data(&self, table_name: &str, page: usize) {
-        let ConnectionState::Connected { pool, .. } = &self.connection else {
+        let ConnectionState::Connected { pool, db_type, .. } = &self.connection else {
             return;
         };
         let pool = pool.clone();
+        let db_type = *db_type;
         let sender = self.events.sender();
         let table_name = table_name.to_string();
 
         tokio::spawn(async move {
-            let result = fetch_table_page(&pool, &table_name, page).await;
+            let result = fetch_table_page(&pool, &table_name, page, db_type).await;
             let _ = sender.send(Event::App(AppEvent::TableDataLoaded(result)));
         });
     }
@@ -805,6 +1081,11 @@ impl App {
             return Ok(());
         }
 
+        // Handle connection manager modal when visible
+        if self.connection_manager.visible {
+            return self.handle_connection_manager_keys(key_event);
+        }
+
         if key_event.code == KeyCode::Tab {
             self.focused_pane = if key_event.modifiers.contains(KeyModifiers::SHIFT) {
                 self.focused_pane.prev()
@@ -824,6 +1105,15 @@ impl App {
             return Ok(());
         }
 
+        // Open connection manager with 'c' when not in Editor mode
+        if key_event.code == KeyCode::Char('c')
+            && self.focused_pane != FocusedPane::Editor
+            && !self.show_query_results
+        {
+            self.connection_manager.open();
+            return Ok(());
+        }
+
         match self.focused_pane {
             FocusedPane::Editor => self.handle_editor_keys(key_event),
             FocusedPane::Sidebar => self.handle_sidebar_keys(key_event),
@@ -835,6 +1125,98 @@ impl App {
                 Ok(())
             }
             FocusedPane::Logs => self.handle_logs_keys(key_event),
+        }
+    }
+
+    fn handle_connection_manager_keys(&mut self, key_event: KeyEvent) -> color_eyre::Result<()> {
+        match &self.connection_manager.mode {
+            ConnectionManagerMode::List => match key_event.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.connection_manager.close();
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.connection_manager.navigate(-1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.connection_manager.navigate(1);
+                }
+                KeyCode::Enter => {
+                    self.connect_to_selected();
+                }
+                KeyCode::Char('a') => {
+                    self.connection_manager.start_adding();
+                }
+                KeyCode::Char('d') => {
+                    self.connection_manager.delete_selected();
+                }
+                _ => {}
+            },
+            ConnectionManagerMode::AddingName => match key_event.code {
+                KeyCode::Esc => {
+                    self.connection_manager.cancel_adding();
+                }
+                KeyCode::Enter => {
+                    self.connection_manager.mode = ConnectionManagerMode::AddingUrl;
+                }
+                KeyCode::Backspace => {
+                    self.connection_manager.input_name.pop();
+                }
+                KeyCode::Char(c) => {
+                    self.connection_manager.input_name.push(c);
+                }
+                _ => {}
+            },
+            ConnectionManagerMode::AddingUrl => match key_event.code {
+                KeyCode::Esc => {
+                    self.connection_manager.cancel_adding();
+                }
+                KeyCode::Enter => {
+                    self.connection_manager.finish_adding();
+                }
+                KeyCode::Backspace => {
+                    self.connection_manager.input_url.pop();
+                }
+                KeyCode::Char(c) => {
+                    self.connection_manager.input_url.push(c);
+                }
+                _ => {}
+            },
+        }
+        Ok(())
+    }
+
+    fn connect_to_selected(&mut self) {
+        let index = self.connection_manager.selected_index;
+        if let Some(conn) = self.connection_manager.connections.get(index).cloned() {
+            info!("Connecting to: {} ({})", conn.name, conn.display_host());
+            self.connection_manager.mark_used(index);
+            self.connection_manager.close();
+
+            // Cancel existing background tasks
+            if let Some(h) = self.stats_handle.take() {
+                h.abort();
+            }
+            if let Some(h) = self.schema_handle.take() {
+                h.abort();
+            }
+
+            // Reset state for new connection
+            self.connection = ConnectionState::Connecting;
+            self.current_view = CurrentView::ConnectionStatus;
+            self.database_url = conn.url.clone();
+            self.db_structure = None;
+            self.tables.clear();
+            self.selected_table = None;
+            self.stats.host = conn.display_host();
+            self.stats.database.clear();
+
+            // Start new connection
+            let sender = self.events.sender();
+            let url = conn.url;
+            tokio::spawn(async move {
+                let result = connect_to_database(&url).await;
+                let _ = sender.send(Event::App(AppEvent::ConnectionResult(result)));
+            });
         }
     }
 
@@ -1190,13 +1572,14 @@ impl App {
     }
 
     fn refresh_schema(&mut self) {
-        let ConnectionState::Connected { pool, .. } = &self.connection else {
+        let ConnectionState::Connected { pool, db_type, .. } = &self.connection else {
             return;
         };
         let pool = pool.clone();
+        let db_type = *db_type;
         let sender = self.events.sender();
         tokio::spawn(async move {
-            let structure = fetch_database_structure(&pool).await;
+            let structure = fetch_database_structure(&pool, db_type).await;
             let _ = sender.send(Event::App(AppEvent::SchemaLoaded(structure)));
         });
     }
@@ -1349,57 +1732,214 @@ impl Drop for App {
     }
 }
 
-async fn connect_to_database(url: &str) -> Result<(PgPool, String), String> {
-    let pool = PgPool::connect(url).await.map_err(|e| format!("{e}"))?;
-    let db_name: (String,) = sqlx::query_as("SELECT current_database()")
+async fn connect_to_database(url: &str) -> Result<(AnyPool, String, DbType), String> {
+    use sqlx::any::AnyConnectOptions;
+    use std::str::FromStr;
+
+    let db_type = DbType::from_url(url);
+
+    info!(
+        "Connecting to {} at {}",
+        db_type.label(),
+        url.split('@').next_back().unwrap_or("?")
+    );
+    debug!(
+        "URL length={}, trimmed={}",
+        url.len(),
+        url.len() == url.trim().len()
+    );
+
+    let pool = match db_type {
+        DbType::MySQL => {
+            // Append ssl-mode=disabled to avoid the 0x49 SSLRequest error
+            // with Docker MySQL's self-signed certs / disabled SSL
+            let ssl_url = if url.contains('?') {
+                format!("{url}&ssl-mode=disabled")
+            } else {
+                format!("{url}?ssl-mode=disabled")
+            };
+
+            debug!("MySQL connect URL (ssl-mode=disabled): {}", url);
+
+            let any_opts = AnyConnectOptions::from_str(&ssl_url)
+                .map_err(|e| format!("Invalid MySQL URL: {e}"))?;
+            AnyPool::connect_with(any_opts).await.map_err(|e| {
+                tracing::error!("MySQL connection error: {:#}", e);
+                format!("{e}")
+            })?
+        }
+        DbType::Postgres => {
+            let any_opts = AnyConnectOptions::from_str(url)
+                .map_err(|e| format!("Invalid Postgres URL: {e}"))?;
+            AnyPool::connect_with(any_opts).await.map_err(|e| {
+                tracing::error!("Postgres connection error: {:#}", e);
+                format!("{e}")
+            })?
+        }
+    };
+
+    let db_name_query = match db_type {
+        DbType::Postgres => "SELECT current_database()",
+        DbType::MySQL => "SELECT DATABASE()",
+    };
+
+    let db_name = match sqlx::query_scalar::<_, Option<String>>(db_name_query)
         .fetch_one(&pool)
         .await
-        .map_err(|e| format!("Connected but failed to query database name: {e}"))?;
-    Ok((pool, db_name.0))
+    {
+        Ok(Some(name)) => {
+            debug!("Database name query returned: {:?}", name);
+            name
+        }
+        Ok(None) => {
+            debug!("Database name query returned NULL, falling back to URL path");
+            db_name_from_url(url)
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Failed to query database name (decode error): {:#}. Falling back to URL.",
+                e
+            );
+            db_name_from_url(url)
+        }
+    };
+
+    info!("Connected to {} database: {}", db_type.label(), db_name);
+    Ok((pool, db_name, db_type))
 }
 
-async fn fetch_database_structure(pool: &PgPool) -> DatabaseStructure {
-    let schemas: Vec<String> = sqlx::query_as::<_, (String,)>(
-        r#"SELECT schema_name FROM information_schema.schemata 
-           WHERE schema_name NOT IN ('pg_catalog', 'pg_toast', 'information_schema')
-           ORDER BY CASE WHEN schema_name = 'public' THEN 0 ELSE 1 END, schema_name"#,
-    )
-    .fetch_all(pool)
-    .await
-    .map(|rows| rows.into_iter().map(|(name,)| name).collect())
-    .unwrap_or_else(|_| vec!["public".to_string()]);
+/// Extract database name from a connection URL path segment, e.g.
+/// `postgres://user:pass@host:5432/mydb` → `"mydb"`.
+fn db_name_from_url(url: &str) -> String {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|u| {
+            let path = u.path().trim_start_matches('/');
+            if path.is_empty() {
+                None
+            } else {
+                Some(path.to_string())
+            }
+        })
+        .unwrap_or_else(|| "unknown".into())
+}
 
-    let tables: Vec<(String, String)> = sqlx::query_as::<_, (String, String)>(
-        r#"SELECT table_schema, table_name FROM information_schema.tables 
+/// Quote a table/identifier appropriately for the database type.
+fn quote_ident(name: &str, db_type: DbType) -> String {
+    match db_type {
+        DbType::Postgres => format!("\"{}\"", name),
+        DbType::MySQL => format!("`{}`", name),
+    }
+}
+
+/// Schemas to exclude from structure queries.
+fn excluded_schemas(db_type: DbType) -> &'static str {
+    match db_type {
+        DbType::Postgres => "('pg_catalog', 'pg_toast', 'information_schema')",
+        DbType::MySQL => "('information_schema', 'performance_schema', 'mysql', 'sys')",
+    }
+}
+
+async fn fetch_database_structure(pool: &AnyPool, db_type: DbType) -> DatabaseStructure {
+    let excl = excluded_schemas(db_type);
+
+    let schema_query = match db_type {
+        DbType::Postgres => format!(
+            r#"SELECT schema_name FROM information_schema.schemata
+               WHERE schema_name NOT IN {excl}
+               ORDER BY CASE WHEN schema_name = 'public' THEN 0 ELSE 1 END, schema_name"#
+        ),
+        DbType::MySQL => format!(
+            r#"SELECT schema_name FROM information_schema.schemata
+               WHERE schema_name NOT IN {excl}
+               ORDER BY schema_name"#
+        ),
+    };
+
+    let schemas: Vec<String> = sqlx::query_scalar(&schema_query)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_else(|_| match db_type {
+            DbType::Postgres => vec!["public".to_string()],
+            DbType::MySQL => vec![],
+        });
+
+    let table_query = format!(
+        r#"SELECT table_schema, table_name FROM information_schema.tables
            WHERE table_type = 'BASE TABLE'
-             AND table_schema NOT IN ('pg_catalog', 'pg_toast', 'information_schema')
-           ORDER BY table_schema, table_name"#,
-    )
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default();
+             AND table_schema NOT IN {excl}
+           ORDER BY table_schema, table_name"#
+    );
 
-    let columns: Vec<(String, String, String, String, String, i32)> = sqlx::query_as::<_, (String, String, String, String, String, i32)>(
-        r#"SELECT c.table_schema, c.table_name, c.column_name, c.data_type, c.is_nullable, c.ordinal_position
+    let table_rows = sqlx::query(&table_query)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+
+    let tables: Vec<(String, String)> = table_rows
+        .iter()
+        .map(|r| {
+            (
+                r.try_get::<String, _>(0).unwrap_or_default(),
+                r.try_get::<String, _>(1).unwrap_or_default(),
+            )
+        })
+        .collect();
+
+    let col_ordinal_cast = match db_type {
+        DbType::Postgres => "c.ordinal_position",
+        DbType::MySQL => "CAST(c.ordinal_position AS SIGNED)",
+    };
+    let col_query = format!(
+        r#"SELECT c.table_schema, c.table_name, c.column_name, c.data_type, c.is_nullable, {col_ordinal_cast}
            FROM information_schema.columns c
-           WHERE c.table_schema NOT IN ('pg_catalog', 'pg_toast', 'information_schema')
-           ORDER BY c.table_schema, c.table_name, c.ordinal_position"#,
-    )
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default();
+           WHERE c.table_schema NOT IN {excl}
+           ORDER BY c.table_schema, c.table_name, c.ordinal_position"#
+    );
 
-    let pk_columns: Vec<(String, String, String)> = sqlx::query_as::<_, (String, String, String)>(
+    let col_rows = sqlx::query(&col_query)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+
+    let columns: Vec<(String, String, String, String, String, i32)> = col_rows
+        .iter()
+        .map(|r| {
+            (
+                r.try_get::<String, _>(0).unwrap_or_default(),
+                r.try_get::<String, _>(1).unwrap_or_default(),
+                r.try_get::<String, _>(2).unwrap_or_default(),
+                r.try_get::<String, _>(3).unwrap_or_default(),
+                r.try_get::<String, _>(4).unwrap_or_default(),
+                r.try_get::<i32, _>(5).unwrap_or(0),
+            )
+        })
+        .collect();
+
+    let pk_query = format!(
         r#"SELECT tc.table_schema, tc.table_name, kcu.column_name
            FROM information_schema.table_constraints tc
            JOIN information_schema.key_column_usage kcu
                ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
            WHERE tc.constraint_type = 'PRIMARY KEY'
-             AND tc.table_schema NOT IN ('pg_catalog', 'pg_toast', 'information_schema')"#,
-    )
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default();
+             AND tc.table_schema NOT IN {excl}"#
+    );
+
+    let pk_rows = sqlx::query(&pk_query)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+
+    let pk_columns: Vec<(String, String, String)> = pk_rows
+        .iter()
+        .map(|r| {
+            (
+                r.try_get::<String, _>(0).unwrap_or_default(),
+                r.try_get::<String, _>(1).unwrap_or_default(),
+                r.try_get::<String, _>(2).unwrap_or_default(),
+            )
+        })
+        .collect();
 
     use std::collections::{HashMap, HashSet};
 
@@ -1461,59 +2001,80 @@ fn format_data_type(data_type: &str) -> String {
     }
 }
 
-async fn fetch_stats(pool: &PgPool) -> Option<StatsUpdate> {
-    let pg_version: String = sqlx::query_scalar("SELECT version()")
+async fn fetch_stats(pool: &AnyPool, db_type: DbType) -> Option<StatsUpdate> {
+    let version: String = sqlx::query_scalar("SELECT version()")
         .fetch_one(pool)
         .await
         .ok()
         .map(|v: String| v.split_whitespace().take(2).collect::<Vec<_>>().join(" "))
         .unwrap_or_else(|| "Unknown".into());
 
-    let total_rows: i64 = sqlx::query_scalar(
-        r#"SELECT COALESCE(SUM(n_live_tup), 0)::bigint FROM pg_stat_user_tables WHERE schemaname = 'public'"#,
-    )
-    .fetch_one(pool)
-    .await
-    .unwrap_or(0);
+    let total_rows: i64 = match db_type {
+        DbType::Postgres => {
+            sqlx::query_scalar::<_, i64>(
+                r#"SELECT COALESCE(SUM(n_live_tup), 0)::bigint FROM pg_stat_user_tables WHERE schemaname = 'public'"#,
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap_or(0)
+        }
+        DbType::MySQL => {
+            sqlx::query_scalar::<_, i64>(
+                r#"SELECT IFNULL(SUM(table_rows), 0)
+                   FROM information_schema.tables
+                   WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE'"#,
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap_or(0)
+        }
+    };
 
     Some(StatsUpdate {
-        pg_version,
+        pg_version: version,
         total_rows,
     })
 }
 
 async fn fetch_table_page(
-    pool: &PgPool,
+    pool: &AnyPool,
     table_name: &str,
     page: usize,
+    db_type: DbType,
 ) -> Result<TableDataResult, String> {
     let offset = page * PAGE_SIZE;
+    let quoted = quote_ident(table_name, db_type);
 
-    let total_count: (i64,) = sqlx::query_as(&format!(r#"SELECT COUNT(*) FROM "{}""#, table_name))
+    let count_row = sqlx::query(&format!("SELECT COUNT(*) FROM {quoted}"))
         .fetch_one(pool)
         .await
         .map_err(|e| format!("Failed to get row count: {e}"))?;
+    let total_count: i64 = count_row.try_get(0).unwrap_or(0);
 
     let rows = sqlx::query(&format!(
-        r#"SELECT * FROM "{}" LIMIT {} OFFSET {}"#,
-        table_name, PAGE_SIZE, offset
+        "SELECT * FROM {quoted} LIMIT {PAGE_SIZE} OFFSET {offset}"
     ))
     .fetch_all(pool)
     .await
     .map_err(|e| format!("Failed to fetch data: {e}"))?;
 
     let columns: Vec<String> = if rows.is_empty() {
-        sqlx::query_as::<_, (String,)>(&format!(
-            r#"SELECT column_name FROM information_schema.columns 
-               WHERE table_schema = 'public' AND table_name = '{}' ORDER BY ordinal_position"#,
-            table_name
+        let default_schema = match db_type {
+            DbType::Postgres => "'public'",
+            DbType::MySQL => "DATABASE()",
+        };
+        let col_rows = sqlx::query(&format!(
+            "SELECT column_name FROM information_schema.columns \
+             WHERE table_schema = {default_schema} AND table_name = '{table_name}' \
+             ORDER BY ordinal_position"
         ))
         .fetch_all(pool)
         .await
-        .map_err(|e| format!("Failed to get column info: {e}"))?
-        .into_iter()
-        .map(|(name,)| name)
-        .collect()
+        .map_err(|e| format!("Failed to get column info: {e}"))?;
+        col_rows
+            .iter()
+            .map(|r| r.try_get::<String, _>(0).unwrap_or_default())
+            .collect()
     } else {
         rows[0]
             .columns()
@@ -1531,12 +2092,12 @@ async fn fetch_table_page(
         table_name: table_name.to_string(),
         columns,
         rows: string_rows,
-        total_count: total_count.0,
+        total_count,
         page,
     })
 }
 
-async fn execute_sql_query(pool: &PgPool, query: &str) -> Result<QueryResult, String> {
+async fn execute_sql_query(pool: &AnyPool, query: &str) -> Result<QueryResult, String> {
     let start = Instant::now();
     let is_explain = query.trim().to_uppercase().starts_with("EXPLAIN");
 
@@ -1567,7 +2128,7 @@ async fn execute_sql_query(pool: &PgPool, query: &str) -> Result<QueryResult, St
     })
 }
 
-fn row_to_strings(row: &sqlx::postgres::PgRow, col_count: usize) -> Vec<String> {
+fn row_to_strings(row: &sqlx::any::AnyRow, col_count: usize) -> Vec<String> {
     (0..col_count)
         .map(|i| {
             row.try_get::<String, _>(i)
