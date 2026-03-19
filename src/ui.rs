@@ -141,6 +141,11 @@ impl Widget for &App {
         if self.connection_manager.visible {
             render_connection_manager(self, area, buf);
         }
+
+        // Render export modal on top if visible
+        if self.export_modal {
+            render_export_modal(area, buf);
+        }
     }
 }
 
@@ -719,7 +724,7 @@ fn render_table_view(state: &TableViewState, app: &App, area: Rect, buf: &mut Bu
         );
     }
 
-    render_table_footer(state, layout[1], buf);
+    render_table_footer(state, app.export_status_text(), layout[1], buf);
 }
 
 fn render_query_results(qr: &QueryResultState, app: &App, area: Rect, buf: &mut Buffer) {
@@ -776,22 +781,35 @@ fn render_query_results(qr: &QueryResultState, app: &App, area: Rect, buf: &mut 
         );
     }
 
-    Paragraph::new(Line::from(vec![
-        Span::styled(
-            format!("{} rows", qr.row_count),
-            Style::default().fg(TEXT_NORMAL),
-        ),
-        Span::styled(" │ ", Style::default().fg(SEPARATOR)),
-        Span::styled(
-            format!("{}ms", qr.duration_ms),
-            Style::default().fg(TEXT_SUCCESS),
-        ),
-        Span::styled(" │ ", Style::default().fg(SEPARATOR)),
-        Span::styled("c", Style::default().fg(TEXT_NORMAL)),
-        Span::styled(" clear", Style::default().fg(TEXT_DIM)),
-    ]))
-    .alignment(Alignment::Center)
-    .render(layout[1], buf);
+    if let Some(msg) = app.export_status_text() {
+        let color = if msg.starts_with('✓') {
+            TEXT_SUCCESS
+        } else {
+            TEXT_ERROR
+        };
+        Paragraph::new(Span::styled(msg, Style::default().fg(color)))
+            .alignment(Alignment::Center)
+            .render(layout[1], buf);
+    } else {
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                format!("{} rows", qr.row_count),
+                Style::default().fg(TEXT_NORMAL),
+            ),
+            Span::styled(" │ ", Style::default().fg(SEPARATOR)),
+            Span::styled(
+                format!("{}ms", qr.duration_ms),
+                Style::default().fg(TEXT_SUCCESS),
+            ),
+            Span::styled(" │ ", Style::default().fg(SEPARATOR)),
+            Span::styled("c", Style::default().fg(TEXT_NORMAL)),
+            Span::styled(" clear  ", Style::default().fg(TEXT_DIM)),
+            Span::styled("x", Style::default().fg(TEXT_NORMAL)),
+            Span::styled(" export", Style::default().fg(TEXT_DIM)),
+        ]))
+        .alignment(Alignment::Center)
+        .render(layout[1], buf);
+    }
 }
 
 fn render_centered_message(area: Rect, buf: &mut Buffer, prefix: &str, msg: &str, color: Color) {
@@ -883,7 +901,24 @@ fn render_data_table(
         .render(area, buf);
 }
 
-fn render_table_footer(state: &TableViewState, area: Rect, buf: &mut Buffer) {
+fn render_table_footer(
+    state: &TableViewState,
+    export_msg: Option<&str>,
+    area: Rect,
+    buf: &mut Buffer,
+) {
+    if let Some(msg) = export_msg {
+        let color = if msg.starts_with('✓') {
+            TEXT_SUCCESS
+        } else {
+            TEXT_ERROR
+        };
+        Paragraph::new(Span::styled(msg, Style::default().fg(color)))
+            .alignment(Alignment::Center)
+            .render(area, buf);
+        return;
+    }
+
     Paragraph::new(Line::from(vec![
         Span::styled("Page ", Style::default().fg(TEXT_DIM)),
         Span::styled(
@@ -904,7 +939,9 @@ fn render_table_footer(state: &TableViewState, area: Rect, buf: &mut Buffer) {
         Span::styled("←→", Style::default().fg(TEXT_NORMAL)),
         Span::styled(" page  ", Style::default().fg(TEXT_DIM)),
         Span::styled("↑↓", Style::default().fg(TEXT_NORMAL)),
-        Span::styled(" row", Style::default().fg(TEXT_DIM)),
+        Span::styled(" row  ", Style::default().fg(TEXT_DIM)),
+        Span::styled("x", Style::default().fg(TEXT_NORMAL)),
+        Span::styled(" export", Style::default().fg(TEXT_DIM)),
     ]))
     .alignment(Alignment::Center)
     .render(area, buf);
@@ -1348,4 +1385,51 @@ fn truncate_str(s: &str, max_len: usize) -> String {
     } else {
         format!("{}…", &s[..max_len - 1])
     }
+}
+
+fn render_export_modal(area: Rect, buf: &mut Buffer) {
+    let modal_width = 38u16.min(area.width.saturating_sub(4));
+    let modal_height = 9u16.min(area.height.saturating_sub(4));
+    let modal_x = (area.width.saturating_sub(modal_width)) / 2;
+    let modal_y = (area.height.saturating_sub(modal_height)) / 2;
+    let modal_area = Rect::new(modal_x, modal_y, modal_width, modal_height);
+
+    Clear.render(modal_area, buf);
+
+    let block = Block::bordered()
+        .title(" Export ")
+        .title_style(Style::default().fg(BORDER_FOCUSED).bold())
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(BORDER_FOCUSED))
+        .style(Style::default().bg(BG));
+
+    let inner = block.inner(modal_area);
+    block.render(modal_area, buf);
+
+    Paragraph::new(vec![
+        Line::from(Span::styled(
+            "Choose a format:",
+            Style::default().fg(TEXT_DIM),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("c", Style::default().fg(TEXT_NORMAL).bold()),
+            Span::styled(" CSV   ", Style::default().fg(TEXT_DIM)),
+            Span::styled("t", Style::default().fg(TEXT_NORMAL).bold()),
+            Span::styled(" TSV", Style::default().fg(TEXT_DIM)),
+        ]),
+        Line::from(vec![
+            Span::styled("j", Style::default().fg(TEXT_NORMAL).bold()),
+            Span::styled(" JSON  ", Style::default().fg(TEXT_DIM)),
+            Span::styled("m", Style::default().fg(TEXT_NORMAL).bold()),
+            Span::styled(" Markdown", Style::default().fg(TEXT_DIM)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Esc", Style::default().fg(TEXT_NORMAL).bold()),
+            Span::styled(" cancel", Style::default().fg(TEXT_DIM)),
+        ]),
+    ])
+    .alignment(Alignment::Center)
+    .render(inner, buf);
 }

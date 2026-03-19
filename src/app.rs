@@ -162,6 +162,25 @@ impl ConnectionsFile {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportFormat {
+    Csv,
+    Tsv,
+    Json,
+    Markdown,
+}
+
+impl ExportFormat {
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::Csv => "csv",
+            Self::Tsv => "tsv",
+            Self::Json => "json",
+            Self::Markdown => "md",
+        }
+    }
+}
+
 /// State for the connection manager modal
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionManagerMode {
@@ -591,6 +610,8 @@ pub struct App {
     pub tree_state: TreeState<TreeNodeId>,
     pub selected_table: Option<(String, String)>,
     pub connection_manager: ConnectionManagerState,
+    pub export_modal: bool,
+    pub export_message: Option<(String, Instant)>,
 }
 
 impl std::fmt::Debug for App {
@@ -709,6 +730,8 @@ impl App {
             tree_state: TreeState::default(),
             selected_table: None,
             connection_manager,
+            export_modal: false,
+            export_message: None,
         }
     }
 
@@ -716,7 +739,13 @@ impl App {
         while self.running {
             terminal.draw(|frame| frame.render_widget(&self, frame.area()))?;
             match self.events.next().await? {
-                Event::Tick => {}
+                Event::Tick => {
+                    if let Some((_, ts)) = &self.export_message {
+                        if ts.elapsed() >= Duration::from_secs(2) {
+                            self.export_message = None;
+                        }
+                    }
+                }
                 Event::Crossterm(event) => match event {
                     crossterm::event::Event::Key(key_event)
                         if key_event.kind == crossterm::event::KeyEventKind::Press =>
@@ -1083,6 +1112,11 @@ impl App {
         {
             self.running = false;
             return Ok(());
+        }
+
+        // Handle export modal when visible
+        if self.export_modal {
+            return self.handle_export_modal_keys(key_event);
         }
 
         // Handle connection manager modal when visible
@@ -1597,6 +1631,22 @@ impl App {
     }
 
     fn handle_results_keys(&mut self, key_event: KeyEvent) -> color_eyre::Result<()> {
+        if key_event.code == KeyCode::Char('x') {
+            let has_data = if self.show_query_results {
+                self.query_result
+                    .as_ref()
+                    .is_some_and(|qr| !qr.columns.is_empty())
+            } else if let CurrentView::TableView(state) = &self.current_view {
+                !state.columns.is_empty()
+            } else {
+                false
+            };
+            if has_data {
+                self.export_modal = true;
+                return Ok(());
+            }
+        }
+
         if key_event.code == KeyCode::Char('c') && self.show_query_results {
             self.show_query_results = false;
             self.query_result = None;
@@ -1668,6 +1718,64 @@ impl App {
     pub fn query_elapsed_ms(&self) -> Option<u128> {
         self.query_start_time.map(|t| t.elapsed().as_millis())
     }
+
+    fn handle_export_modal_keys(&mut self, key_event: KeyEvent) -> color_eyre::Result<()> {
+        match key_event.code {
+            KeyCode::Char('c') => self.do_export(ExportFormat::Csv),
+            KeyCode::Char('t') => self.do_export(ExportFormat::Tsv),
+            KeyCode::Char('j') => self.do_export(ExportFormat::Json),
+            KeyCode::Char('m') => self.do_export(ExportFormat::Markdown),
+            KeyCode::Esc => self.export_modal = false,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn do_export(&mut self, format: ExportFormat) {
+        let data = if self.show_query_results {
+            self.query_result
+                .as_ref()
+                .filter(|qr| !qr.columns.is_empty())
+                .map(|qr| (qr.columns.clone(), qr.rows.clone()))
+        } else if let CurrentView::TableView(state) = &self.current_view {
+            if !state.columns.is_empty() {
+                Some((state.columns.clone(), state.rows.clone()))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        self.export_modal = false;
+
+        let Some((columns, rows)) = data else {
+            return;
+        };
+
+        let filename = format!("export.{}", format.extension());
+        let result = match format {
+            ExportFormat::Csv => export_csv(&filename, &columns, &rows),
+            ExportFormat::Tsv => export_tsv(&filename, &columns, &rows),
+            ExportFormat::Json => export_json(&filename, &columns, &rows),
+            ExportFormat::Markdown => export_markdown(&filename, &columns, &rows),
+        };
+
+        self.export_message = Some((
+            match result {
+                Ok(()) => format!("✓ Exported to {filename}"),
+                Err(e) => format!("✗ Export failed: {e}"),
+            },
+            Instant::now(),
+        ));
+    }
+
+    pub fn export_status_text(&self) -> Option<&str> {
+        self.export_message
+            .as_ref()
+            .filter(|(_, ts)| ts.elapsed() < Duration::from_secs(2))
+            .map(|(msg, _)| msg.as_str())
+    }
 }
 
 fn handle_list_navigation(
@@ -1716,6 +1824,85 @@ fn handle_list_navigation(
     if *selected >= *scroll_offset + DEFAULT_VISIBLE_ROWS {
         *scroll_offset = selected.saturating_sub(DEFAULT_VISIBLE_ROWS - 1);
     }
+}
+
+fn csv_quote(s: &str) -> String {
+    if s.contains(',') || s.contains('\n') || s.contains('"') {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
+fn export_csv(filename: &str, columns: &[String], rows: &[Vec<String>]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::File::create(filename)?;
+    writeln!(
+        f,
+        "{}",
+        columns.iter().map(|c| csv_quote(c)).collect::<Vec<_>>().join(",")
+    )?;
+    for row in rows {
+        writeln!(
+            f,
+            "{}",
+            row.iter().map(|v| csv_quote(v)).collect::<Vec<_>>().join(",")
+        )?;
+    }
+    Ok(())
+}
+
+fn export_tsv(filename: &str, columns: &[String], rows: &[Vec<String>]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::File::create(filename)?;
+    writeln!(f, "{}", columns.join("\t"))?;
+    for row in rows {
+        writeln!(f, "{}", row.join("\t"))?;
+    }
+    Ok(())
+}
+
+fn export_json(filename: &str, columns: &[String], rows: &[Vec<String>]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::File::create(filename)?;
+    let objects: Vec<String> = rows
+        .iter()
+        .map(|row| {
+            let fields: Vec<String> = columns
+                .iter()
+                .zip(row.iter())
+                .map(|(k, v)| {
+                    format!(
+                        "  \"{}\": \"{}\"",
+                        k.replace('"', "\\\""),
+                        v.replace('"', "\\\"")
+                    )
+                })
+                .collect();
+            format!("{{\n{}\n}}", fields.join(",\n"))
+        })
+        .collect();
+    writeln!(f, "[\n{}\n]", objects.join(",\n"))?;
+    Ok(())
+}
+
+fn export_markdown(
+    filename: &str,
+    columns: &[String],
+    rows: &[Vec<String>],
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::File::create(filename)?;
+    writeln!(f, "| {} |", columns.join(" | "))?;
+    writeln!(
+        f,
+        "| {} |",
+        columns.iter().map(|_| "---").collect::<Vec<_>>().join(" | ")
+    )?;
+    for row in rows {
+        writeln!(f, "| {} |", row.join(" | "))?;
+    }
+    Ok(())
 }
 
 fn is_execute_key_combo(key_event: &KeyEvent) -> bool {
@@ -1857,7 +2044,7 @@ async fn fetch_database_structure(pool: &AnyPool, db_type: DbType) -> DatabaseSt
 
     let schema_query = match db_type {
         DbType::Postgres => format!(
-            r#"SELECT schema_name FROM information_schema.schemata
+            r#"SELECT schema_name::text FROM information_schema.schemata
                WHERE schema_name NOT IN {excl}
                ORDER BY CASE WHEN schema_name = 'public' THEN 0 ELSE 1 END, schema_name"#
         ),
@@ -1876,12 +2063,20 @@ async fn fetch_database_structure(pool: &AnyPool, db_type: DbType) -> DatabaseSt
             DbType::MySQL => vec![],
         });
 
-    let table_query = format!(
-        r#"SELECT table_schema, table_name FROM information_schema.tables
-           WHERE table_type = 'BASE TABLE'
-             AND table_schema NOT IN {excl}
-           ORDER BY table_schema, table_name"#
-    );
+    let table_query = match db_type {
+        DbType::Postgres => format!(
+            r#"SELECT table_schema::text, table_name::text FROM information_schema.tables
+               WHERE table_type = 'BASE TABLE'
+                 AND table_schema NOT IN {excl}
+               ORDER BY table_schema, table_name"#
+        ),
+        DbType::MySQL => format!(
+            r#"SELECT table_schema, table_name FROM information_schema.tables
+               WHERE table_type = 'BASE TABLE'
+                 AND table_schema NOT IN {excl}
+               ORDER BY table_schema, table_name"#
+        ),
+    };
 
     let table_rows = sqlx::query(&table_query)
         .fetch_all(pool)
@@ -1898,16 +2093,22 @@ async fn fetch_database_structure(pool: &AnyPool, db_type: DbType) -> DatabaseSt
         })
         .collect();
 
-    let col_ordinal_cast = match db_type {
-        DbType::Postgres => "c.ordinal_position",
-        DbType::MySQL => "CAST(c.ordinal_position AS SIGNED)",
+    let col_query = match db_type {
+        DbType::Postgres => format!(
+            r#"SELECT c.table_schema::text, c.table_name::text, c.column_name::text,
+                      c.data_type::text, c.is_nullable::text, c.ordinal_position
+               FROM information_schema.columns c
+               WHERE c.table_schema NOT IN {excl}
+               ORDER BY c.table_schema, c.table_name, c.ordinal_position"#
+        ),
+        DbType::MySQL => format!(
+            r#"SELECT c.table_schema, c.table_name, c.column_name,
+                      c.data_type, c.is_nullable, CAST(c.ordinal_position AS SIGNED)
+               FROM information_schema.columns c
+               WHERE c.table_schema NOT IN {excl}
+               ORDER BY c.table_schema, c.table_name, c.ordinal_position"#
+        ),
     };
-    let col_query = format!(
-        r#"SELECT c.table_schema, c.table_name, c.column_name, c.data_type, c.is_nullable, {col_ordinal_cast}
-           FROM information_schema.columns c
-           WHERE c.table_schema NOT IN {excl}
-           ORDER BY c.table_schema, c.table_name, c.ordinal_position"#
-    );
 
     let col_rows = sqlx::query(&col_query)
         .fetch_all(pool)
@@ -1928,14 +2129,24 @@ async fn fetch_database_structure(pool: &AnyPool, db_type: DbType) -> DatabaseSt
         })
         .collect();
 
-    let pk_query = format!(
-        r#"SELECT tc.table_schema, tc.table_name, kcu.column_name
-           FROM information_schema.table_constraints tc
-           JOIN information_schema.key_column_usage kcu
-               ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
-           WHERE tc.constraint_type = 'PRIMARY KEY'
-             AND tc.table_schema NOT IN {excl}"#
-    );
+    let pk_query = match db_type {
+        DbType::Postgres => format!(
+            r#"SELECT tc.table_schema::text, tc.table_name::text, kcu.column_name::text
+               FROM information_schema.table_constraints tc
+               JOIN information_schema.key_column_usage kcu
+                   ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
+               WHERE tc.constraint_type = 'PRIMARY KEY'
+                 AND tc.table_schema NOT IN {excl}"#
+        ),
+        DbType::MySQL => format!(
+            r#"SELECT tc.table_schema, tc.table_name, kcu.column_name
+               FROM information_schema.table_constraints tc
+               JOIN information_schema.key_column_usage kcu
+                   ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
+               WHERE tc.constraint_type = 'PRIMARY KEY'
+                 AND tc.table_schema NOT IN {excl}"#
+        ),
+    };
 
     let pk_rows = sqlx::query(&pk_query)
         .fetch_all(pool)
@@ -2063,37 +2274,63 @@ async fn fetch_table_page(
         .map_err(|e| format!("Failed to get row count: {e}"))?;
     let total_count: i64 = count_row.try_get(0).unwrap_or(0);
 
+    // Split "schema.table" or default to ("public", table_name)
+    let (schema_name, bare_table) = table_name
+        .split_once('.')
+        .unwrap_or(("public", table_name));
+
+    // Fetch column names so we can build a text-cast SELECT.
+    // This avoids AnyPool type-decoding failures for DATE, NUMERIC, UUID, etc.
+    let col_name_query = match db_type {
+        DbType::Postgres => format!(
+            "SELECT column_name::text FROM information_schema.columns \
+             WHERE table_schema = '{schema_name}' AND table_name = '{bare_table}' \
+             ORDER BY ordinal_position"
+        ),
+        DbType::MySQL => format!(
+            "SELECT column_name FROM information_schema.columns \
+             WHERE table_schema = DATABASE() AND table_name = '{bare_table}' \
+             ORDER BY ordinal_position"
+        ),
+    };
+
+    let col_rows = sqlx::query(&col_name_query)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| format!("Failed to get column info: {e}"))?;
+
+    let columns: Vec<String> = col_rows
+        .iter()
+        .map(|r| r.try_get::<String, _>(0).unwrap_or_default())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if columns.is_empty() {
+        return Ok(TableDataResult {
+            table_name: table_name.to_string(),
+            columns: vec![],
+            rows: vec![],
+            total_count,
+            page,
+        });
+    }
+
+    // Build SELECT with explicit text casts for every column
+    let select_cols = columns
+        .iter()
+        .map(|col| match db_type {
+            DbType::Postgres => format!("\"{}\"::text", col),
+            DbType::MySQL => format!("CAST(`{}` AS CHAR)", col),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
     let rows = sqlx::query(&format!(
-        "SELECT * FROM {quoted} LIMIT {PAGE_SIZE} OFFSET {offset}"
+        "SELECT {select_cols} FROM {quoted} LIMIT {PAGE_SIZE} OFFSET {offset}"
     ))
     .fetch_all(pool)
     .await
     .map_err(|e| format!("Failed to fetch data: {e}"))?;
-
-    let columns: Vec<String> = if rows.is_empty() {
-        let default_schema = match db_type {
-            DbType::Postgres => "'public'",
-            DbType::MySQL => "DATABASE()",
-        };
-        let col_rows = sqlx::query(&format!(
-            "SELECT column_name FROM information_schema.columns \
-             WHERE table_schema = {default_schema} AND table_name = '{table_name}' \
-             ORDER BY ordinal_position"
-        ))
-        .fetch_all(pool)
-        .await
-        .map_err(|e| format!("Failed to get column info: {e}"))?;
-        col_rows
-            .iter()
-            .map(|r| r.try_get::<String, _>(0).unwrap_or_default())
-            .collect()
-    } else {
-        rows[0]
-            .columns()
-            .iter()
-            .map(|c| c.name().to_string())
-            .collect()
-    };
 
     let string_rows: Vec<Vec<String>> = rows
         .iter()
