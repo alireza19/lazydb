@@ -1232,13 +1232,22 @@ fn render_connection_list(cm: &crate::app::ConnectionManagerState, area: Rect, b
             })
             .collect();
 
-        Paragraph::new(lines).render(list_area, buf);
+        // Content width: 2 (cursor) + 20 (name) + 3 (│) + 20 (host) + 3 (│) + 8 (type) + 3 (│) + 10 (date)
+        let content_width: u16 = 69;
+        let max_scroll = content_width.saturating_sub(list_area.width);
+        let scroll_x = (cm.scroll_x as u16).min(max_scroll);
+
+        Paragraph::new(lines)
+            .scroll((0, scroll_x))
+            .render(list_area, buf);
     }
 
     // Footer with keybindings
     Paragraph::new(vec![Line::from(vec![
         Span::styled("↑↓", Style::default().fg(TEXT_NORMAL)),
         Span::styled(" navigate  ", Style::default().fg(TEXT_DIM)),
+        Span::styled("←→", Style::default().fg(TEXT_NORMAL)),
+        Span::styled(" scroll  ", Style::default().fg(TEXT_DIM)),
         Span::styled("Enter", Style::default().fg(TEXT_NORMAL)),
         Span::styled(" connect  ", Style::default().fg(TEXT_DIM)),
         Span::styled("a", Style::default().fg(TEXT_NORMAL)),

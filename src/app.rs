@@ -175,6 +175,7 @@ pub struct ConnectionManagerState {
     pub visible: bool,
     pub connections: Vec<SavedConnection>,
     pub selected_index: usize,
+    pub scroll_x: usize,
     pub mode: ConnectionManagerMode,
     pub input_name: String,
     pub input_url: String,
@@ -186,6 +187,7 @@ impl Default for ConnectionManagerState {
             visible: false,
             connections: Vec::new(),
             selected_index: 0,
+            scroll_x: 0,
             mode: ConnectionManagerMode::List,
             input_name: String::new(),
             input_url: String::new(),
@@ -199,6 +201,7 @@ impl ConnectionManagerState {
         self.connections = file.connections;
         self.visible = true;
         self.selected_index = 0;
+        self.scroll_x = 0;
         self.mode = ConnectionManagerMode::List;
         self.input_name.clear();
         self.input_url.clear();
@@ -206,6 +209,7 @@ impl ConnectionManagerState {
 
     pub fn close(&mut self) {
         self.visible = false;
+        self.scroll_x = 0;
         self.mode = ConnectionManagerMode::List;
         self.input_name.clear();
         self.input_url.clear();
@@ -1148,6 +1152,14 @@ impl App {
                 }
                 KeyCode::Char('d') => {
                     self.connection_manager.delete_selected();
+                }
+                KeyCode::Left | KeyCode::Char('h') => {
+                    self.connection_manager.scroll_x =
+                        self.connection_manager.scroll_x.saturating_sub(4);
+                }
+                KeyCode::Right | KeyCode::Char('l') => {
+                    self.connection_manager.scroll_x =
+                        self.connection_manager.scroll_x.saturating_add(4);
                 }
                 _ => {}
             },
