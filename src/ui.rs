@@ -13,6 +13,7 @@ use crate::app::{
 };
 use crate::dotline::{AsciiDotGraph, make_color_fn};
 
+const BG: Color = Color::Rgb(20, 20, 20);
 const BORDER_NORMAL: Color = Color::White;
 const BORDER_FOCUSED: Color = Color::Rgb(255, 140, 0);
 const TEXT_NORMAL: Color = Color::White;
@@ -126,6 +127,7 @@ fn pane_block(title: &str, focused: bool) -> Block<'_> {
         .title_style(title_style())
         .border_type(BorderType::Rounded)
         .border_style(border_style(focused))
+        .style(Style::default().bg(BG))
 }
 
 impl Widget for &App {
@@ -259,6 +261,7 @@ fn render_global_status_bar(app: &App, area: Rect, buf: &mut Buffer) {
         Span::styled("q", Style::default().fg(TEXT_NORMAL)),
         Span::styled(" quit", Style::default().fg(TEXT_DIM)),
     ]))
+    .style(Style::default().bg(BG))
     .alignment(Alignment::Center)
     .render(area, buf);
 }
@@ -926,7 +929,8 @@ fn render_sql_editor(app: &App, area: Rect, buf: &mut Buffer) {
             Style::default().fg(TEXT_DIM)
         })
         .border_type(BorderType::Rounded)
-        .border_style(border_style(is_focused));
+        .border_style(border_style(is_focused))
+        .style(Style::default().bg(BG));
 
     let inner = block.inner(area);
     block.render(area, buf);
