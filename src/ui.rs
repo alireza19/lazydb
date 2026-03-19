@@ -3,7 +3,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
-    widgets::{Block, BorderType, Cell, Paragraph, Row, Table, Widget, Wrap},
+    widgets::{Block, BorderType, Cell, Clear, Paragraph, Row, Table, Widget, Wrap},
 };
 use tui_logger::TuiLoggerSmartWidget;
 
@@ -1115,15 +1115,8 @@ fn render_connection_manager(app: &App, area: Rect, buf: &mut Buffer) {
     let modal_y = (area.height.saturating_sub(modal_height)) / 2;
     let modal_area = Rect::new(modal_x, modal_y, modal_width, modal_height);
 
-    // Clear the modal area with a dark background
-    for y in modal_area.y..modal_area.y + modal_area.height {
-        for x in modal_area.x..modal_area.x + modal_area.width {
-            if let Some(cell) = buf.cell_mut((x, y)) {
-                cell.set_char(' ');
-                cell.set_style(Style::default().bg(Color::Rgb(20, 20, 20)));
-            }
-        }
-    }
+    // Fully reset all cells in the modal area before drawing
+    Clear.render(modal_area, buf);
 
     let cm = &app.connection_manager;
     let title = match cm.mode {
@@ -1136,7 +1129,8 @@ fn render_connection_manager(app: &App, area: Rect, buf: &mut Buffer) {
         .title(title)
         .title_style(Style::default().fg(BORDER_FOCUSED).bold())
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(BORDER_FOCUSED));
+        .border_style(Style::default().fg(BORDER_FOCUSED))
+        .style(Style::default().bg(Color::Rgb(20, 20, 20)));
 
     let inner = block.inner(modal_area);
     block.render(modal_area, buf);
