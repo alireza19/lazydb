@@ -1891,13 +1891,20 @@ fn export_csv(filename: &str, columns: &[String], rows: &[Vec<String>]) -> std::
     writeln!(
         f,
         "{}",
-        columns.iter().map(|c| csv_quote(c)).collect::<Vec<_>>().join(",")
+        columns
+            .iter()
+            .map(|c| csv_quote(c))
+            .collect::<Vec<_>>()
+            .join(",")
     )?;
     for row in rows {
         writeln!(
             f,
             "{}",
-            row.iter().map(|v| csv_quote(v)).collect::<Vec<_>>().join(",")
+            row.iter()
+                .map(|v| csv_quote(v))
+                .collect::<Vec<_>>()
+                .join(",")
         )?;
     }
     Ok(())
@@ -1948,7 +1955,11 @@ fn export_markdown(
     writeln!(
         f,
         "| {} |",
-        columns.iter().map(|_| "---").collect::<Vec<_>>().join(" | ")
+        columns
+            .iter()
+            .map(|_| "---")
+            .collect::<Vec<_>>()
+            .join(" | ")
     )?;
     for row in rows {
         writeln!(f, "| {} |", row.join(" | "))?;
@@ -2326,9 +2337,7 @@ async fn fetch_table_page(
     let total_count: i64 = count_row.try_get(0).unwrap_or(0);
 
     // Split "schema.table" or default to ("public", table_name)
-    let (schema_name, bare_table) = table_name
-        .split_once('.')
-        .unwrap_or(("public", table_name));
+    let (schema_name, bare_table) = table_name.split_once('.').unwrap_or(("public", table_name));
 
     // Fetch column names so we can build a text-cast SELECT.
     // This avoids AnyPool type-decoding failures for DATE, NUMERIC, UUID, etc.
