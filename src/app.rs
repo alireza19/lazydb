@@ -9,6 +9,7 @@ use ratatui::{
     crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
 };
 use sqlx::{AnyPool, Column, Row};
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::env;
 use std::time::{Duration, Instant};
@@ -436,6 +437,7 @@ pub struct TableViewState {
     pub page: usize,
     pub selected_row: usize,
     pub scroll_offset: usize,
+    pub col_offset: usize,
     pub loading: bool,
     pub error: Option<String>,
 }
@@ -565,6 +567,7 @@ pub struct QueryResultState {
     pub is_explain: bool,
     pub selected_row: usize,
     pub scroll_offset: usize,
+    pub col_offset: usize,
     pub error: Option<String>,
 }
 
@@ -612,6 +615,10 @@ pub struct App {
     pub connection_manager: ConnectionManagerState,
     pub export_modal: bool,
     pub export_message: Option<(String, Instant)>,
+    /// Actual data-table area height set during render (interior mutability).
+    pub results_area_height: Cell<u16>,
+    /// Actual SQL editor area height set during render (interior mutability).
+    pub editor_area_height: Cell<u16>,
 }
 
 impl std::fmt::Debug for App {
@@ -732,6 +739,8 @@ impl App {
             connection_manager,
             export_modal: false,
             export_message: None,
+            results_area_height: Cell::new(DEFAULT_VISIBLE_ROWS as u16),
+            editor_area_height: Cell::new(DEFAULT_VISIBLE_ROWS as u16),
         }
     }
 
@@ -855,7 +864,7 @@ impl App {
 
     fn update_editor_scroll(&mut self) {
         let (cursor_row, _) = self.sql_editor.cursor();
-        let visible_rows = DEFAULT_VISIBLE_ROWS.saturating_sub(2);
+        let visible_rows = (self.editor_area_height.get() as usize).max(1);
         if cursor_row < self.editor_scroll_offset {
             self.editor_scroll_offset = cursor_row;
         }
@@ -961,6 +970,7 @@ impl App {
                             is_explain: qr.is_explain,
                             selected_row: 0,
                             scroll_offset: 0,
+                            col_offset: 0,
                             error: None,
                         });
                     }
@@ -974,6 +984,7 @@ impl App {
                             is_explain: false,
                             selected_row: 0,
                             scroll_offset: 0,
+                            col_offset: 0,
                             error: Some(error),
                         });
                     }
@@ -1611,6 +1622,7 @@ impl App {
             page: 0,
             selected_row: 0,
             scroll_offset: 0,
+            col_offset: 0,
             loading: true,
             error: None,
         });
@@ -1667,6 +1679,8 @@ impl App {
             return Ok(());
         }
 
+        let visible_rows = self.results_area_height.get() as usize;
+
         if self.show_query_results {
             if let Some(ref mut qr) = self.query_result
                 && !qr.rows.is_empty()
@@ -1676,7 +1690,21 @@ impl App {
                     &mut qr.selected_row,
                     &mut qr.scroll_offset,
                     qr.rows.len(),
+                    visible_rows,
                 );
+            }
+            // Horizontal column scroll in query results (←/→ not used for page nav here)
+            if let Some(ref mut qr) = self.query_result {
+                let num_cols = qr.columns.len();
+                match key_event.code {
+                    KeyCode::Left | KeyCode::Char('h') => {
+                        qr.col_offset = qr.col_offset.saturating_sub(1);
+                    }
+                    KeyCode::Right | KeyCode::Char('l') if qr.col_offset + 1 < num_cols => {
+                        qr.col_offset += 1;
+                    }
+                    _ => {}
+                }
             }
         } else if let CurrentView::TableView(state) = &mut self.current_view {
             if !state.rows.is_empty() {
@@ -1685,25 +1713,46 @@ impl App {
                     &mut state.selected_row,
                     &mut state.scroll_offset,
                     state.rows.len(),
+                    visible_rows,
                 );
+            }
+
+            // Shift+←/→ scrolls columns; plain ←/→ navigates pages
+            let num_cols = state.columns.len();
+            match (key_event.code, key_event.modifiers) {
+                (KeyCode::Left, KeyModifiers::SHIFT) => {
+                    state.col_offset = state.col_offset.saturating_sub(1);
+                }
+                (KeyCode::Right, KeyModifiers::SHIFT) if state.col_offset + 1 < num_cols => {
+                    state.col_offset += 1;
+                }
+                _ => {}
             }
 
             let mut fetch_page = None;
             match key_event.code {
-                KeyCode::Left | KeyCode::Char('h') if state.page > 0 && !state.loading => {
+                KeyCode::Left | KeyCode::Char('h')
+                    if key_event.modifiers == KeyModifiers::NONE
+                        && state.page > 0
+                        && !state.loading =>
+                {
                     state.page -= 1;
                     state.loading = true;
                     state.selected_row = 0;
                     state.scroll_offset = 0;
+                    state.col_offset = 0;
                     fetch_page = Some((state.table_name.clone(), state.page));
                 }
                 KeyCode::Right | KeyCode::Char('l')
-                    if state.page < state.total_pages().saturating_sub(1) && !state.loading =>
+                    if key_event.modifiers == KeyModifiers::NONE
+                        && state.page < state.total_pages().saturating_sub(1)
+                        && !state.loading =>
                 {
                     state.page += 1;
                     state.loading = true;
                     state.selected_row = 0;
                     state.scroll_offset = 0;
+                    state.col_offset = 0;
                     fetch_page = Some((state.table_name.clone(), state.page));
                 }
                 _ => {}
@@ -1783,7 +1832,9 @@ fn handle_list_navigation(
     selected: &mut usize,
     scroll_offset: &mut usize,
     len: usize,
+    visible_rows: usize,
 ) {
+    let page = visible_rows.max(1);
     match code {
         KeyCode::Up | KeyCode::Char('k') => {
             *selected = if *selected > 0 {
@@ -1792,7 +1843,7 @@ fn handle_list_navigation(
                 len - 1
             };
             if *selected == len - 1 {
-                *scroll_offset = len.saturating_sub(DEFAULT_VISIBLE_ROWS);
+                *scroll_offset = len.saturating_sub(page);
             }
         }
         KeyCode::Down | KeyCode::Char('j') => {
@@ -1805,15 +1856,15 @@ fn handle_list_navigation(
                 *scroll_offset = 0;
             }
         }
-        KeyCode::PageUp => *selected = selected.saturating_sub(DEFAULT_VISIBLE_ROWS),
-        KeyCode::PageDown => *selected = (*selected + DEFAULT_VISIBLE_ROWS).min(len - 1),
+        KeyCode::PageUp => *selected = selected.saturating_sub(page),
+        KeyCode::PageDown => *selected = (*selected + page).min(len - 1),
         KeyCode::Home => {
             *selected = 0;
             *scroll_offset = 0;
         }
         KeyCode::End => {
             *selected = len - 1;
-            *scroll_offset = len.saturating_sub(DEFAULT_VISIBLE_ROWS);
+            *scroll_offset = len.saturating_sub(page);
         }
         _ => return,
     }
@@ -1821,8 +1872,8 @@ fn handle_list_navigation(
     if *selected < *scroll_offset {
         *scroll_offset = *selected;
     }
-    if *selected >= *scroll_offset + DEFAULT_VISIBLE_ROWS {
-        *scroll_offset = selected.saturating_sub(DEFAULT_VISIBLE_ROWS - 1);
+    if *selected >= *scroll_offset + page {
+        *scroll_offset = selected.saturating_sub(page - 1);
     }
 }
 

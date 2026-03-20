@@ -707,6 +707,10 @@ fn render_table_view(state: &TableViewState, app: &App, area: Rect, buf: &mut Bu
 
     let layout = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(inner);
 
+    // Feed actual visible height back so key handlers use the real row count.
+    app.results_area_height
+        .set(layout[0].height.saturating_sub(1));
+
     if state.loading {
         render_centered_message(layout[0], buf, "⟳ ", "Loading...", TEXT_NORMAL);
     } else if let Some(error) = &state.error {
@@ -719,6 +723,7 @@ fn render_table_view(state: &TableViewState, app: &App, area: Rect, buf: &mut Bu
             &state.rows,
             state.selected_row,
             state.scroll_offset,
+            state.col_offset,
             layout[0],
             buf,
         );
@@ -738,6 +743,10 @@ fn render_query_results(qr: &QueryResultState, app: &App, area: Rect, buf: &mut 
     block.render(area, buf);
 
     let layout = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(inner);
+
+    // Feed actual visible height back so key handlers use the real row count.
+    app.results_area_height
+        .set(layout[0].height.saturating_sub(1));
 
     if let Some(error) = &qr.error {
         Paragraph::new(error.clone())
@@ -776,6 +785,7 @@ fn render_query_results(qr: &QueryResultState, app: &App, area: Rect, buf: &mut 
             &qr.rows,
             qr.selected_row,
             qr.scroll_offset,
+            qr.col_offset,
             layout[0],
             buf,
         );
@@ -832,6 +842,7 @@ fn render_data_table(
     rows: &[Vec<String>],
     selected_row: usize,
     scroll_offset: usize,
+    col_offset: usize,
     area: Rect,
     buf: &mut Buffer,
 ) {
@@ -848,12 +859,17 @@ fn render_data_table(
         }
     }
 
-    let constraints: Vec<Constraint> = col_widths
+    // Apply column offset — skip the first col_offset columns
+    let col_offset = col_offset.min(columns.len().saturating_sub(1));
+    let vis_columns = &columns[col_offset..];
+    let vis_widths = &col_widths[col_offset..];
+
+    let constraints: Vec<Constraint> = vis_widths
         .iter()
         .map(|&w| Constraint::Length((w + 2) as u16))
         .collect();
     let header = Row::new(
-        columns
+        vis_columns
             .iter()
             .map(|col| Cell::from(col.clone()).style(Style::default().fg(TEXT_NORMAL).bold())),
     )
@@ -875,6 +891,7 @@ fn render_data_table(
 
             let cells: Vec<Cell> = row
                 .iter()
+                .skip(col_offset)
                 .map(|cell| {
                     let display = if cell.len() > 30 {
                         format!("{}…", &cell[..29])
@@ -940,6 +957,8 @@ fn render_table_footer(
         Span::styled(" page  ", Style::default().fg(TEXT_DIM)),
         Span::styled("↑↓", Style::default().fg(TEXT_NORMAL)),
         Span::styled(" row  ", Style::default().fg(TEXT_DIM)),
+        Span::styled("⇧←→", Style::default().fg(TEXT_NORMAL)),
+        Span::styled(" cols  ", Style::default().fg(TEXT_DIM)),
         Span::styled("x", Style::default().fg(TEXT_NORMAL)),
         Span::styled(" export", Style::default().fg(TEXT_DIM)),
     ]))
@@ -975,11 +994,22 @@ fn render_sql_editor(app: &App, area: Rect, buf: &mut Buffer) {
     let layout = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
     let editor_area = layout[0];
 
+    // Feed actual editor height back so update_editor_scroll uses the real size.
+    app.editor_area_height.set(editor_area.height);
+
     let lines = app.sql_editor.lines();
     let cursor = app.sql_editor.cursor();
     let visible_rows = editor_area.height as usize;
     let scroll_offset = app.editor_scroll_offset.min(lines.len().saturating_sub(1));
     let end_idx = (scroll_offset + visible_rows).min(lines.len());
+
+    // Horizontal scroll: keep cursor visible
+    let editor_width = editor_area.width as usize;
+    let h_scroll = if editor_width > 0 && cursor.1 >= editor_width {
+        cursor.1 - editor_width + 1
+    } else {
+        0
+    };
 
     let highlighted_lines: Vec<Line> = lines
         .iter()
@@ -997,11 +1027,14 @@ fn render_sql_editor(app: &App, area: Rect, buf: &mut Buffer) {
         })
         .collect();
 
-    Paragraph::new(highlighted_lines).render(editor_area, buf);
+    Paragraph::new(highlighted_lines)
+        .scroll((0, h_scroll as u16))
+        .render(editor_area, buf);
 
     if is_focused && cursor.0 >= scroll_offset && cursor.0 < end_idx {
         let cursor_y = editor_area.y + (cursor.0 - scroll_offset) as u16;
-        let cursor_x = editor_area.x + cursor.1 as u16;
+        let cursor_screen_x = cursor.1.saturating_sub(h_scroll);
+        let cursor_x = editor_area.x + cursor_screen_x as u16;
         if cursor_y < editor_area.y + editor_area.height
             && cursor_x < editor_area.x + editor_area.width
             && let Some(cell) = buf.cell_mut((cursor_x, cursor_y))
